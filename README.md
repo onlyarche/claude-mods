@@ -52,3 +52,7 @@ claude plugin install usage-hud@personal-mods
 claude plugin validate ~/.claude/mods/usage-hud
 claude plugin test ~/.claude/mods/usage-hud
 ```
+
+## License
+
+[MIT](LICENSE): free to use, copy, modify and redistribute, keeping the copyright notice.

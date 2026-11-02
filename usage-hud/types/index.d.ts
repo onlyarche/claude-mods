@@ -75,6 +75,44 @@ export type HudLink = {
 /** A subagent or teammate of this session, alive now. */
 export type HudAgent = { id: string; type: string; description: string; status: string }
 
+/** Which build of the HUD runs: its version, and the copy it was loaded from. */
+export type HudBuild = {
+  version?: string
+  /** `local` (a folder, ~/.claude/mods), `claude.ai` (synced from an upload), `installed` (a copy) */
+  source?: string
+}
+
+/** One block sent to the model with a prompt, besides the typed text. */
+export type HudCtxItem = {
+  kind: 'file' | 'memory' | 'hook' | 'plugin' | 'notice' | 'media' | 'base'
+  label: string
+  /** Estimated tokens; absent for media, whose cost the text does not show. */
+  tokens?: number
+  /** Its kind as the engine names it (`skill_listing`, `claudeMd`). */
+  type?: string
+  /** Who sent it: the engine, a settings hook, a plugin, a paste. */
+  from?: string
+  /** Its whole length, in characters. */
+  chars?: number
+  /** Its text's head, shown when the item is picked. */
+  preview?: string
+}
+
+/** The prompt item whose details are open in the HUD, if any. */
+export type HudPick = { card?: string; index?: number }
+
+/** A prompt you typed, and what went to the model with it. */
+export type HudPromptCard = {
+  /** The turn it started; the transcript row it is drawn in is `ctx-<id>`. */
+  id: string
+  typedChars: number
+  typedTokens: number
+  items: HudCtxItem[]
+  /** True while its first request is still gathering what it carries. */
+  isOpen: boolean
+  at: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'usage-hud': {
@@ -95,6 +133,12 @@ declare module 'claude-code' {
       session: Shaped<HudSession>
       links: Shaped<HudLink[]>
       agents: Shaped<HudAgent[]>
+      /** The last prompts typed, with what each sent along. */
+      prompts: Shaped<HudPromptCard[]>
+      build: Shaped<HudBuild>
+      picked: Shaped<HudPick>
+      /** The HUD's folded sections: `prompt`, `mix`, `tools`. */
+      folded: string[]
     }
   }
 }

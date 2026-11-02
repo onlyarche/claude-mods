@@ -9,7 +9,7 @@ import type {
   SessionRateLimit,
 } from 'claude-code'
 
-import type { HudCompaction, HudGroups, HudSnapshot, HudTally } from '../types'
+import type { HudCompaction, HudCtxItem, HudGroups, HudPromptCard, HudSnapshot, HudTally } from '../types'
 import {
   breakdownLines,
   exitLines,
@@ -21,8 +21,9 @@ import {
   tokens,
   usd,
 } from './draw'
-import type { Line } from './draw'
+import type { Action, Line } from './draw'
 import { applyOps, endedTask, LINK_TOOLS, linkOps, titleFrom, transcriptPath } from './links'
+import { attachmentItem, cardLines, contextItems, estimateTokens, mediaItem, promptSection } from './prompts'
 import { maskBlock } from './secrets'
 import { bump, mcpUse, namedUse } from './stats'
 import type { Use } from './stats'
@@ -31,6 +32,8 @@ const PANE = 'usage-hud'
 const TITLE = 'Usage'
 const STORE_DENOMINATOR = 'denominator'
 const STORE_TALLIES = 'tallies'
+const STORE_FOLDED = 'folded'
+const SECTIONS = new Set(['prompt', 'mix', 'tools'])
 const DEFAULT_DENOMINATOR = 8
 /** Fewest rows the top block draws, however small 1/n of the screen is. */
 const MIN_ROWS = 4
@@ -78,6 +81,26 @@ const running = atom({ plugin: 'usage-hud', key: 'running' } as const, [], { sha
 const session = atom({ plugin: 'usage-hud', key: 'session' } as const, {}, { shape: 'session-1' })
 const links = atom({ plugin: 'usage-hud', key: 'links' } as const, [], { shape: 'links-1' })
 const agents = atom({ plugin: 'usage-hud', key: 'agents' } as const, [], { shape: 'agents-1' })
+const prompts = atom({ plugin: 'usage-hud', key: 'prompts' } as const, [], { shape: 'prompts-1' })
+const build = atom({ plugin: 'usage-hud', key: 'build' } as const, {}, { shape: 'build-1' })
+const picked = atom({ plugin: 'usage-hud', key: 'picked' } as const, {}, { shape: 'picked-1' })
+const folded = atom({ plugin: 'usage-hud', key: 'folded' } as const, [] as string[])
+
+/** Where this copy was loaded from, by its folder. */
+const sourceOf = (root: string): string =>
+  root.includes('/plugins/synced/') ? 'claude.ai' : root.includes('/plugins/cache/') ? 'installed' : 'local'
+
+/** This copy's version from its own manifest: no API hands a plugin its version. */
+async function readBuild($: EngineInterface): Promise<void> {
+  try {
+    const manifest = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)) as { version?: unknown }
+    const version = typeof manifest.version === 'string' ? manifest.version : undefined
+    await update($, build, () => json({ version, source: sourceOf($.plugin.root) }))
+  } catch (error) {
+    debug($, 'manifest read', error)
+  }
+}
+const CARD_ROW = 'ctx-'
 
 // The dock width last asked for, so a redraw asks again only on a change.
 let askedColumns: number | undefined
@@ -88,6 +111,46 @@ let transcript: string | undefined
 // The last slash command counted, so the skill it expands is not counted
 // toward its plugin twice.
 let lastCommand: { name: string; at: number } | undefined
+// The prompt typed and not yet started as a turn, gathering what it carries.
+let pending: HudPromptCard | undefined
+// The card whose first request is still gathering, once its turn started.
+let collecting: string | undefined
+// The paths this prompt @-mentioned, to name the files it sent.
+let mentioned: string[] = []
+// Blocks computed before their prompt is (the engine reads a prompt's
+// first-message context and its @-mentions before raising prompt.submit).
+let orphans: HudCtxItem[] = []
+// True while a main-loop turn runs: what it injects then is no prompt's own.
+let isTurnRunning = false
+
+/** Who typed it: the terminal, Remote Control, an SDK host (the desktop app), Slack. */
+const TYPED = new Set(['composer', 'bridge', 'sdk', 'slack-ping'])
+
+/** Adds what a prompt sent along to its card, wherever that card stands. */
+async function carry($: EngineInterface, items: HudCtxItem[]): Promise<void> {
+  if (items.length === 0) return
+  if (collecting !== undefined) {
+    const id = collecting
+    await update($, prompts, list =>
+      list.map(card => (card.id === id ? { ...card, items: [...card.items, ...items].slice(0, 60) } : card)),
+    )
+  } else if (pending !== undefined) {
+    pending = { ...pending, items: [...pending.items, ...items] }
+  } else if (!isTurnRunning) {
+    // between turns: it belongs to the prompt about to be submitted
+    orphans = [...orphans, ...items]
+  }
+  // mid-turn, after the prompt's own request: a reminder, not the prompt's
+}
+
+/** The card stops gathering: its first request has gone. */
+async function closeCards($: EngineInterface): Promise<void> {
+  collecting = undefined
+  mentioned = []
+  await update($, prompts, list =>
+    list.some(card => card.isOpen) ? list.map(card => ({ ...card, isOpen: false })) : list,
+  )
+}
 
 type Usage = {
   context: SessionContextUsage
@@ -275,13 +338,21 @@ export const register: Register = (on, options) => {
     typeof options.compactInstructions === 'string' ? options.compactInstructions.trim() : ''
   const isTurnToastOn = options.turnToast !== false
   const isMaskOn = options.maskSecrets !== false
+  const isPromptCardOn = options.promptContext !== false
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-hud',
       description: 'Open the usage HUD, or size it: /usage-hud 6 takes 1/6 of the screen',
-      argumentHint: '[2-16 | close]',
+      argumentHint: '[2-16 | close | version]',
     })
+    await readBuild($)
+    // folded sections stay folded across sessions
+    const keptFolds = await $.store.get(STORE_FOLDED)
+    if (Array.isArray(keptFolds)) {
+      const sections = keptFolds.filter((one): one is string => typeof one === 'string' && SECTIONS.has(one))
+      await update($, folded, () => sections)
+    }
     const den = await $.store.get(STORE_DENOMINATOR)
     await update($, denominator, () => (isDenominator(den) ? den : DEFAULT_DENOMINATOR))
     const kept = await $.store.get(STORE_TALLIES)
@@ -328,9 +399,61 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // ---- what a prompt you typed sent to the model ----
+
+  on('prompt.submit', async ($, e, next) => {
+    // Yours only: not a notification, a peer's message or a hidden prompt.
+    const isMine = TYPED.has(e.origin.kind) && e.isMeta !== true
+    if (isMine) {
+      // The card exists before `next`: the turn starts, and the request's
+      // attachments arrive, while `next` runs.
+      pending = {
+        id: '',
+        typedChars: [...e.text].length,
+        typedTokens: estimateTokens(e.text),
+        items: [...orphans, ...(e.attachments ?? []).map(mediaItem)],
+        isOpen: true,
+        at: await $.clock.now(),
+      }
+      orphans = []
+    }
+    const result = await next(e)
+    if (isMine && pending !== undefined) {
+      if (result.drop !== undefined) pending = undefined
+      else pending = { ...pending, typedChars: [...result.text].length, typedTokens: estimateTokens(result.text) }
+    }
+
+    return result
+  }).catch(($, e, next) => next(e)) // never stands in a prompt's way
+
+  on('prompt.mention', async ($, e, next) => {
+    const read = await next(e)
+    if (e.agentId === undefined && !('deny' in read && typeof read.deny === 'string')) {
+      mentioned = [...mentioned, e.path]
+    }
+    return read
+  }).catch(($, e, next) => next(e))
+
+  on('prompt.context', async ($, e, next) => {
+    const sent = await next(e)
+    await carry($, contextItems(sent.blocks, sent.instructionFiles ?? e.instructionFiles))
+    return sent
+  }).catch(($, e, next) => next(e))
+
+  on('prompt.attachment', async ($, e, next) => {
+    const sent = await next(e)
+    // the main loop's, and only what is actually sent (a hook may drop it)
+    if (e.agentId === undefined && typeof sent.text === 'string' && sent.text !== '') {
+      await carry($, [attachmentItem(e.type, sent.text, e.origin, mentioned)])
+    }
+    return sent
+  }).catch(($, e, next) => next(e))
+
   // ---- tool calls: MCP use, and what the session opens and closes ----
 
   on('tool.call', async ($, e, next) => {
+    // the main loop's first tool call: the prompt's own request has gone
+    if (e.agentId === undefined && collecting !== undefined) await closeCards($)
     const tool = String(e.tool)
     const use = mcpUse(tool)
     if (use === undefined && !LINK_TOOLS.has(tool)) return next(e)
@@ -403,6 +526,23 @@ export const register: Register = (on, options) => {
       turnStart = undefined
     }
 
+    isTurnRunning = true
+    // The prompt that started this turn: its card joins the list, and a
+    // row right under the prompt in the transcript draws it. A turn no
+    // prompt of yours started takes no card, and what it gathered goes.
+    if (pending === undefined) {
+      orphans = []
+      mentioned = []
+    } else {
+      const card: HudPromptCard = { ...pending, id: e.turnId }
+      pending = undefined
+      collecting = card.id
+      await update($, prompts, list => [...list, card].slice(-40))
+      if (isPromptCardOn) {
+        await $.ui.place({ id: `${CARD_ROW}${card.id}` }).catch(error => debug($, 'card row', error))
+      }
+    }
+
     return next(e)
   })
 
@@ -412,6 +552,8 @@ export const register: Register = (on, options) => {
       await refreshAgents($)
       return result
     }
+    isTurnRunning = false
+    await closeCards($)
 
     const started = turnStart?.turnId === e.turnId ? turnStart.usd : undefined
     turnStart = undefined
@@ -527,6 +669,9 @@ export const register: Register = (on, options) => {
       await update($, masked, () => 0)
       await update($, tallies, () => [])
       await update($, session, () => ({}))
+      await update($, prompts, () => [])
+      pending = undefined
+      collecting = undefined
       await update($, snapshot, held =>
         held.context === undefined ? held : { ...held, context: { window: held.context.window } },
       )
@@ -543,11 +688,16 @@ export const register: Register = (on, options) => {
       await $.ui.close({ id: PANE })
       return { text: 'Usage HUD closed.' }
     }
+    if (arg === 'version') {
+      const held = await read($, build)
+      const version = held.version !== undefined ? `usage-hud ${held.version}` : 'usage-hud (version unknown)'
+      return { text: `${version}, loaded from ${held.source ?? sourceOf($.plugin.root)}: ${$.plugin.root}` }
+    }
     let den = await read($, denominator)
     if (arg !== '') {
       const n = Number(arg)
       if (!isDenominator(n)) {
-        return { text: 'Usage: /usage-hud [2-16 | close]. The top block takes 1/n of the screen.' }
+        return { text: 'Usage: /usage-hud [2-16 | close | version]. The top block takes 1/n of the screen.' }
       }
       den = n
       await update($, denominator, () => n)
@@ -562,7 +712,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive] =
+    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive, typed, held, pick0, folds] =
       await Promise.all([
         read($, snapshot),
         read($, compactions),
@@ -577,6 +727,10 @@ export const register: Register = (on, options) => {
         read($, session),
         read($, links),
         read($, agents),
+        read($, prompts),
+        read($, build),
+        read($, picked),
+        read($, folded),
       ])
     const viewport = e.viewport
     const isDock = e.props.placement === 'dock' && viewport !== undefined
@@ -593,30 +747,61 @@ export const register: Register = (on, options) => {
     }
 
     // Top: which session, then the block that takes 1/den of the height.
-    // Docked, the bottom holds what ending the session touches, and the
-    // middle the context mix and tool stats, as far as the room goes.
+    // Docked, the middle holds the last prompt, the context mix and the tool
+    // stats, each a section its title folds, and the bottom what ending the
+    // session touches.
     const topRows = isDock ? Math.max(MIN_ROWS, Math.round(viewport.rows / den)) : INLINE_ROWS
     const upper = [
-      ...headerLines(sess, width),
+      ...headerLines(sess, held, width),
       ...hudLines(snap, log, busy, maskedCount, at, width).slice(0, topRows),
     ]
-    let lines: Line[] = upper
+    const card = typed[typed.length - 1]
+    const pick = card !== undefined && pick0.card === card.id ? pick0.index : undefined
+    const isFolded = (id: string) => folds.includes(id)
+    let lines: Line[]
     if (isDock) {
       const room = Math.max(upper.length, e.props.scroll.bodyRows)
-      const bottom = exitLines(open, alive, at, width)
-      const middleRoom = Math.max(0, room - upper.length - bottom.length)
       const middle = [
-        ...breakdownLines(mix, width),
-        ...statsLines(calls, used, every, mix, width),
-      ].slice(0, middleRoom)
-      const gap: Line[] = Array.from({ length: middleRoom - middle.length }, () => [])
-      lines = [...upper, ...middle, ...gap, ...bottom].slice(0, room)
+        ...promptSection(card, pick, isFolded('prompt'), width),
+        ...breakdownLines(mix, width, isFolded('mix')),
+        ...statsLines(calls, used, every, mix, width, isFolded('tools')),
+      ]
+      const bottom = exitLines(open, alive, at, width)
+      const spare = room - upper.length - middle.length - bottom.length
+      // Fits: the bottom sits at the dock's foot. Taller than the dock: it
+      // follows the rest, and the pane scrolls (click it, then the wheel or
+      // the arrows); folding a section gives the room back.
+      const gap: Line[] = Array.from({ length: Math.max(0, spare) }, () => [])
+      lines = [...upper, ...middle, ...gap, ...bottom]
+    } else {
+      // Inline above the prompt: the last prompt's title line only.
+      lines = [...upper, ...promptSection(card, undefined, true, width)]
     }
 
     const copyOut = async (text: string) => {
       const copied = await $.ui.copy({ text, surface: e.surface })
       $.ui.toast(copied.isCopied ? `copied: ${text}` : 'could not copy here')
     }
+    const press = (action: Action) => {
+      if ('copy' in action) return void copyOut(action.copy)
+      if ('select' in action) {
+        const { card: id, index } = action.select
+        return void update($, picked, now =>
+          now.card === id && now.index === index ? {} : { card: id, index },
+        )
+      }
+      // `update` may run its change again on a race, so the save follows it
+      return void update($, folded, now =>
+        now.includes(action.toggle) ? now.filter(one => one !== action.toggle) : [...now, action.toggle],
+      )
+        .then(next => $.store.set(STORE_FOLDED, next))
+        .catch(error => debug($, 'fold save', error))
+    }
+    // A button's key stays the same across redraws, so focus stays put.
+    const keyOf = (action: Action, i: number) =>
+      'copy' in action ? `copy-${i}`
+        : 'select' in action ? `item-${action.select.card}-${action.select.index}`
+          : `toggle-${action.toggle}`
 
     return (
       <Box flexDirection="column">
@@ -625,15 +810,40 @@ export const register: Register = (on, options) => {
             <Text {...textStyle(run)}>{run.text}</Text>
           ))
           if (texts.length === 0) return <Text> </Text>
-          const copy = runs.find(run => run.copy !== undefined)?.copy
-          return copy === undefined ? (
-            <Box flexDirection="row">{texts}</Box>
-          ) : (
-            <Button key={`copy-${i}`} plain onPress={() => void copyOut(copy)}>
-              {texts}
-            </Button>
+          const action = runs.find(run => run.action !== undefined)?.action
+          if (action === undefined) return <Box flexDirection="row">{texts}</Box>
+          const key = keyOf(action, i)
+          // the keyed Box is the area the pointer hovers: the row lights up
+          return (
+            <Box key={`row-${key}`} flexDirection="row">
+              <Button key={key} plain hover={{ inverse: true }} onPress={() => press(action)}>
+                {texts}
+              </Button>
+            </Box>
           )
         })}
+      </Box>
+    )
+  })
+
+  // The card under a prompt: every plugin's hook hears every placed row, so
+  // a row that is not one of ours passes to the hooks beneath.
+  on('ui.render', { component: 'Placed' }, async ($, e, next) => {
+    if (e.props.plugin !== 'usage-hud' || !e.props.id.startsWith(CARD_ROW)) return next(e)
+    const card = (await read($, prompts)).find(one => `${CARD_ROW}${one.id}` === e.props.id)
+    if (card === undefined) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const width = Math.min(76, Math.max(32, (e.viewport?.columns ?? 80) - 4))
+
+    return (
+      <Box flexDirection="column">
+        {cardLines(card, width).map(runs => (
+          <Box flexDirection="row">
+            {fit(runs, width).map(run => (
+              <Text {...textStyle(run)}>{run.text}</Text>
+            ))}
+          </Box>
+        ))}
       </Box>
     )
   })

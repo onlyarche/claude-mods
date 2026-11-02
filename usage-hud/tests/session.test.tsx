@@ -178,3 +178,24 @@ test('plugin slash commands and subagents are counted, a skill once per plugin',
   expect((await ui.findAll({ type: 'Text', text: /^clear$/ })).length).toBe(0)
   await ui.unmount()
 })
+
+test('the header shows which build runs, and /usage-hud version says where from', async ($, on) => {
+  boot(on)
+  on('fs.read', (_, e) => ({
+    value: e.path.endsWith('/.claude-plugin/plugin.json') ? JSON.stringify({ name: 'usage-hud', version: '9.9.9' }) : '',
+  }))
+  on('command.run', () => ({ text: 'beneath' }))
+
+  await $.session.start(START)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // loaded from a folder of its own (not synced, not a cache copy): local
+  expect(await ui.find({ type: 'Text', text: /^ v9\.9\.9 local$/ })).toBeDefined()
+  await ui.unmount()
+
+  const said = await $.command.run({
+    command: 'usage-hud', args: 'version', origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 200 },
+  } as never)
+  expect(String((said as { text?: string }).text)).toMatch(/^usage-hud 9\.9\.9, loaded from local: \/.+usage-hud$/)
+})

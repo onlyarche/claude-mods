@@ -5,6 +5,7 @@
 import type {
   HudAgent,
   HudBreakdown,
+  HudBuild,
   HudCompaction,
   HudGroups,
   HudLink,
@@ -18,8 +19,17 @@ import { THEME } from './palette'
 import { GLYPH, level, severity } from './severity'
 import { top } from './stats'
 
-/** A colored run; `copy` makes its whole line a button that copies this. */
-export type Run = { text: string; color?: string; bold?: boolean; copy?: string }
+/**
+ * What pressing a line does: copy a text, pick a prompt item to see its
+ * details, or fold a section. A run carrying one makes its line a button.
+ */
+export type Action =
+  | { copy: string }
+  | { select: { card: string; index: number } }
+  | { toggle: string }
+
+/** A colored run; `action` makes its whole line a button. */
+export type Run = { text: string; color?: string; bold?: boolean; action?: Action }
 export type Line = Run[]
 
 const { ink, series } = THEME
@@ -87,6 +97,10 @@ function head(text: string, room: number): string {
   return out
 }
 
+/** `text` padded with spaces to `width` cells (a wide character takes two). */
+export const padCells = (text: string, width: number): string =>
+  text + ' '.repeat(Math.max(0, width - cells(text)))
+
 /** Cuts a line's runs to `width` cells, an ellipsis where it cut. */
 export function fit(runs: Line, width: number): Line {
   const out: Line = []
@@ -96,6 +110,35 @@ export function fit(runs: Line, width: number): Line {
     const text = cells(run.text) > room ? `${head(run.text, room - 1)}…` : run.text
     out.push({ ...run, text })
     room -= cells(text)
+  }
+  return out
+}
+
+/**
+ * A section's title as a button that folds and unfolds it: `▾ title ───`
+ * open, `▸ title ───` folded.
+ */
+export const sectionRule = (id: string, title: string, isFolded: boolean, width: number): Line =>
+  fit([
+    { text: isFolded ? '▸ ' : '▾ ', color: ink.label, bold: true, action: { toggle: id } },
+    { text: `${title} ${'─'.repeat(Math.max(0, width - cells(title) - 3))}`, color: ink.muted },
+  ], width)
+
+/** `text` broken into lines of at most `width` cells, its own breaks kept. */
+export function wrapCells(text: string, width: number): string[] {
+  const out: string[] = []
+  for (const raw of text.replace(/\t/g, '  ').split('\n')) {
+    let rest = raw.trimEnd()
+    if (rest === '') {
+      if (out[out.length - 1] !== '') out.push('')
+      continue
+    }
+    while (cells(rest) > width) {
+      const piece = head(rest, width)
+      out.push(piece)
+      rest = rest.slice(piece.length)
+    }
+    out.push(rest)
   }
   return out
 }
@@ -154,18 +197,32 @@ function gaugeLine(
 
 // ---- the header: which session this is ----------------------------------
 
-/** The session's name, then its id as a button that copies the resume line. */
-export function headerLines(session: HudSession, width: number): Line[] {
+/** `v0.3.0 local`: which build runs, and the copy it was loaded from. */
+export const buildTag = (build: HudBuild): string =>
+  build.version === undefined ? '' : `v${build.version}${build.source !== undefined ? ` ${build.source}` : ''}`
+
+/**
+ * The session's name, then its id as a button that copies the resume line,
+ * the HUD's version at the right of that line (the id is cut there anyway:
+ * the button copies it whole).
+ */
+export function headerLines(session: HudSession, build: HudBuild, width: number): Line[] {
   const out: Line[] = []
+  const tag = buildTag(build)
   if (session.name !== undefined) {
     out.push(fit([{ text: session.name, color: ink.label, bold: true }], width))
   }
   if (session.id !== undefined) {
     const copy = `claude --resume ${session.id}`
-    out.push(fit([
-      { text: '⧉ ', color: THEME.status.ok, bold: true, copy },
-      { text: session.id, color: ink.muted },
-    ], width))
+    const room = Math.max(8, width - 2 - (tag === '' ? 0 : tag.length + 1))
+    const id = cells(session.id) > room ? `${head(session.id, room - 1)}…` : session.id
+    out.push([
+      { text: '⧉ ', color: THEME.status.ok, bold: true, action: { copy } },
+      { text: tag === '' ? id : padCells(id, room), color: ink.muted },
+      ...(tag === '' ? [] : [{ text: ` ${tag}`, color: ink.label }]),
+    ])
+  } else if (tag !== '') {
+    out.push(fit([{ text: `usage-hud ${tag}`, color: ink.muted }], width))
   }
   return out
 }
@@ -288,11 +345,13 @@ function allocate(values: number[], cells: number): number[] {
   return out
 }
 
-export function breakdownLines(b: HudBreakdown, width: number): Line[] {
+export function breakdownLines(b: HudBreakdown, width: number, isFolded = false): Line[] {
   if (!b.isMeasured) return []
   const values = GROUPS.map(g => b.groups[g.key])
   const total = values.reduce((sum, v) => sum + v, 0)
   if (total <= 0) return []
+  const title = sectionRule('mix', 'context mix', isFolded, width)
+  if (isFolded) return [title]
 
   const cells = allocate(values, width)
   const stacked: Line = GROUPS.flatMap((g, i) => {
@@ -318,7 +377,7 @@ export function breakdownLines(b: HudBreakdown, width: number): Line[] {
     ]
   })
 
-  return [rule('context mix', width), stacked, ...legend]
+  return [title, stacked, ...legend]
 }
 
 // ---- tools: MCP servers, skills and plugins, now and most used -----------
@@ -356,8 +415,10 @@ export function statsLines(
   allTime: HudTally[],
   b: HudBreakdown,
   width: number,
+  isFolded = false,
 ): Line[] {
-  const out: Line[] = [rule('tools · session', width)]
+  const out: Line[] = [sectionRule('tools', 'tools · session', isFolded, width)]
+  if (isFolded) return out
   for (const call of running.slice(-3)) {
     out.push(fit([
       { text: '⟳ ', color: THEME.status.ok, bold: true },
@@ -447,7 +508,7 @@ export function exitLines(links: HudLink[], agents: HudAgent[], at: number, widt
     const effect = ` ${item.effect}`.padStart(8)
     const room = Math.max(4, width - 6 - effect.length)
     const cut = cells(item.label) > room ? `${head(item.label, room - 1)}…` : item.label
-    const copy = item.copy !== undefined ? { copy: item.copy } : {}
+    const copy = item.copy !== undefined ? { action: { copy: item.copy } } : {}
     out.push([
       { text: item.kind.padEnd(6), color: ink.label, ...copy },
       { text: cut + ' '.repeat(Math.max(0, room - cells(cut))), color: ink.text },

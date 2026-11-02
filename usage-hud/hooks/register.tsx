@@ -1,0 +1,640 @@
+import { atom, read, update } from 'claude-code'
+import type {
+  ContextCategory,
+  EngineInterface,
+  ModelUsage,
+  Register,
+  SessionContextUsage,
+  SessionCost,
+  SessionRateLimit,
+} from 'claude-code'
+
+import type { HudCompaction, HudGroups, HudSnapshot, HudTally } from '../types'
+import {
+  breakdownLines,
+  exitLines,
+  fit,
+  headerLines,
+  hudLines,
+  seconds,
+  statsLines,
+  tokens,
+  usd,
+} from './draw'
+import type { Line } from './draw'
+import { applyOps, endedTask, LINK_TOOLS, linkOps, titleFrom, transcriptPath } from './links'
+import { maskBlock } from './secrets'
+import { bump, mcpUse, namedUse } from './stats'
+import type { Use } from './stats'
+
+const PANE = 'usage-hud'
+const TITLE = 'Usage'
+const STORE_DENOMINATOR = 'denominator'
+const STORE_TALLIES = 'tallies'
+const DEFAULT_DENOMINATOR = 8
+/** Fewest rows the top block draws, however small 1/n of the screen is. */
+const MIN_ROWS = 4
+/** Rows asked for when the pane sits inline above the prompt. */
+const INLINE_ROWS = 8
+/** The engine docks a pane at least 24 columns and at most 45% wide. */
+const DOCK_MIN = 24
+const DOCK_MAX_SHARE = 0.45
+const TURN_TOAST_MS = 6000
+/** A skill its own slash command ran expands within this long of it. */
+const SAME_RUN_MS = 10_000
+const ALIVE = new Set(['pending', 'running', 'waiting', 'idle'])
+
+const NO_GROUPS: HudGroups = {
+  system: 0, mcp: 0, memory: 0, other: 0, messages: 0, buffer: 0, free: 0,
+}
+
+// Bump a shape tag when that value's fields change: it declines what an
+// earlier version stored, which outlives a reload.
+const snapshot = atom(
+  { plugin: 'usage-hud', key: 'snapshot' } as const,
+  { rateLimits: [] },
+  { shape: 'snapshot-1' },
+)
+const compactions = atom(
+  { plugin: 'usage-hud', key: 'compactions' } as const,
+  [],
+  { shape: 'compactions-1' },
+)
+const isCompacting = atom({ plugin: 'usage-hud', key: 'isCompacting' } as const, false)
+const denominator = atom(
+  { plugin: 'usage-hud', key: 'denominator' } as const,
+  DEFAULT_DENOMINATOR,
+)
+const now = atom({ plugin: 'usage-hud', key: 'now' } as const, 0)
+const masked = atom({ plugin: 'usage-hud', key: 'masked' } as const, 0)
+const breakdown = atom(
+  { plugin: 'usage-hud', key: 'breakdown' } as const,
+  { isMeasured: false, groups: NO_GROUPS, mcpServers: 0, skills: 0 },
+  { shape: 'breakdown-1' },
+)
+const tallies = atom({ plugin: 'usage-hud', key: 'tallies' } as const, [], { shape: 'tallies-1' })
+const allTime = atom({ plugin: 'usage-hud', key: 'allTime' } as const, [], { shape: 'tallies-1' })
+const running = atom({ plugin: 'usage-hud', key: 'running' } as const, [], { shape: 'running-1' })
+const session = atom({ plugin: 'usage-hud', key: 'session' } as const, {}, { shape: 'session-1' })
+const links = atom({ plugin: 'usage-hud', key: 'links' } as const, [], { shape: 'links-1' })
+const agents = atom({ plugin: 'usage-hud', key: 'agents' } as const, [], { shape: 'agents-1' })
+
+// The dock width last asked for, so a redraw asks again only on a change.
+let askedColumns: number | undefined
+// The session's cost when the main loop's running turn started.
+let turnStart: { turnId: string; usd: number } | undefined
+// The transcript file, as a classic event names it, else as worked out.
+let transcript: string | undefined
+// The last slash command counted, so the skill it expands is not counted
+// toward its plugin twice.
+let lastCommand: { name: string; at: number } | undefined
+
+type Usage = {
+  context: SessionContextUsage
+  rateLimits: SessionRateLimit[]
+  cost?: SessionCost
+}
+
+/** Drops undefined fields: $.state holds JSON data only. */
+const json = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
+const isDenominator = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 2 && value <= 16
+
+const isTallies = (value: unknown): value is HudTally[] =>
+  Array.isArray(value) &&
+  value.every(
+    one =>
+      typeof one === 'object' && one !== null &&
+      typeof (one as HudTally).name === 'string' &&
+      typeof (one as HudTally).calls === 'number',
+  )
+
+const absorb = (held: HudSnapshot, usage: Usage): HudSnapshot =>
+  json({
+    ...held,
+    context: {
+      tokens: usage.context.tokens,
+      window: usage.context.window,
+      percent: usage.context.percent,
+    },
+    rateLimits: usage.rateLimits.map(({ kind, percentUsed, resetsAt }) => ({
+      kind,
+      percentUsed,
+      resetsAt,
+    })),
+    costUsd: usage.cost?.usd ?? held.costUsd,
+  })
+
+const dockColumns = (terminalColumns: number, den: number): number =>
+  Math.max(
+    DOCK_MIN,
+    Math.min(Math.round(terminalColumns / den), Math.floor(terminalColumns * DOCK_MAX_SHARE)),
+  )
+
+/** /context's rows, folded into the HUD's groups; deferred tools left out. */
+function group(categories: readonly ContextCategory[]): HudGroups {
+  const groups = { ...NO_GROUPS }
+  for (const c of categories) {
+    if (c.kind === 'deferred' || c.isDeferred) continue
+    const name = c.name.toLowerCase()
+    const key: keyof HudGroups =
+      c.kind === 'free' ? 'free'
+        : c.kind === 'buffer' ? 'buffer'
+          : name.includes('mcp') ? 'mcp'
+            : name.includes('system') ? 'system'
+              : name.includes('memory') ? 'memory'
+                : name.includes('message') ? 'messages'
+                  : 'other'
+    groups[key] += c.tokens
+  }
+  return groups
+}
+
+const debug = ($: EngineInterface, what: string, error: unknown) =>
+  $.ui.log(`usage-hud: ${what} failed: ${String(error)}`, { to: 'debug' })
+
+async function tick($: EngineInterface): Promise<void> {
+  const at = await $.clock.now()
+  await update($, now, () => at)
+}
+
+/**
+ * Reads the context's breakdown (a local estimate: no requests are sent):
+ * the auto-compact point, the context mix, and what is loaded.
+ */
+async function refreshBreakdown($: EngineInterface): Promise<void> {
+  try {
+    const usage = await $.session.usage({ breakdown: 'summary' })
+    const b = usage.context.breakdown
+    if (b === undefined) return // no session bound yet
+    await update($, snapshot, held =>
+      json({
+        ...held,
+        autoCompactAt: b.isAutoCompactEnabled ? b.autoCompactThreshold : undefined,
+        isAutoCompactEnabled: b.isAutoCompactEnabled,
+      }),
+    )
+    await update($, breakdown, () => ({
+      isMeasured: true,
+      groups: group(b.categories),
+      mcpServers: new Set(b.mcpTools.map(tool => tool.serverName)).size,
+      skills: b.skills?.includedSkills ?? 0,
+    }))
+  } catch (error) {
+    debug($, 'breakdown read', error)
+  }
+}
+
+async function refreshUsage($: EngineInterface): Promise<void> {
+  try {
+    const usage = await $.session.usage()
+    await update($, snapshot, held => absorb(held, usage))
+  } catch (error) {
+    debug($, 'usage read', error)
+  }
+}
+
+/**
+ * The session's id, and its name as its transcript records it. No API reads
+ * the name, so this greps the transcript for the entries /rename and the
+ * automatic title write: an internal format, so a miss just leaves no name.
+ */
+async function refreshSession($: EngineInterface): Promise<void> {
+  try {
+    const id = await $.session.id()
+    let name: string | undefined
+    if (transcript !== undefined) {
+      const found = await $.process.run([
+        'grep', '-oE', '"(customTitle|aiTitle)":"([^"\\\\]|\\\\.)*"', transcript,
+      ])
+      name = titleFrom(found.stdout)
+    }
+    await update($, session, () => json({ id, name }))
+  } catch (error) {
+    debug($, 'session read', error)
+  }
+}
+
+async function refreshAgents($: EngineInterface): Promise<void> {
+  try {
+    const list = await $.agent.list()
+    await update($, agents, () =>
+      list
+        .filter(agent => ALIVE.has(agent.status))
+        .map(({ id, type, description, status }) => ({ id, type, description, status })),
+    )
+  } catch (error) {
+    debug($, 'agent list', error)
+  }
+}
+
+/** Artifacts published earlier in this conversation, which outlive it. */
+async function backfillLinks($: EngineInterface, at: number): Promise<void> {
+  try {
+    const messages = await $.session.messages()
+    const ops = messages.flatMap(message =>
+      message.toolUses.flatMap(use => linkOps(use.tool, use.input, use.result, at)),
+    )
+    // only what outlives a process: a shell of an earlier run is long gone
+    const kept = ops.filter(op => !('add' in op) || op.add.survives)
+    if (kept.length > 0) await update($, links, list => applyOps(list, kept))
+  } catch (error) {
+    debug($, 'transcript read', error)
+  }
+}
+
+/** Counts a use this session and across sessions. */
+async function count($: EngineInterface, use: Use, toPlugin = true): Promise<void> {
+  await update($, tallies, list => bump(list, use, toPlugin))
+  const every = await update($, allTime, list => bump(list, use, toPlugin))
+  await $.store.set(STORE_TALLIES, every)
+}
+
+function turnToastText(
+  spent: number,
+  durationMs: number,
+  usage: ModelUsage | undefined,
+  isAborted: boolean,
+): string {
+  const parts = [`turn ${usd(spent)}`, seconds(durationMs)]
+  if (usage !== undefined) parts.push(`${tokens(usage.output_tokens)} out`)
+  if (isAborted) parts.push('interrupted')
+  return parts.join(' · ')
+}
+
+const textStyle = (run: Line[number]) => ({
+  ...(run.color !== undefined && { color: run.color }),
+  ...(run.bold === true && { bold: true }),
+})
+
+// ---- hooks ---------------------------------------------------------------
+
+export const register: Register = (on, options) => {
+  const compactInstructions =
+    typeof options.compactInstructions === 'string' ? options.compactInstructions.trim() : ''
+  const isTurnToastOn = options.turnToast !== false
+  const isMaskOn = options.maskSecrets !== false
+
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'usage-hud',
+      description: 'Open the usage HUD, or size it: /usage-hud 6 takes 1/6 of the screen',
+      argumentHint: '[2-16 | close]',
+    })
+    const den = await $.store.get(STORE_DENOMINATOR)
+    await update($, denominator, () => (isDenominator(den) ? den : DEFAULT_DENOMINATOR))
+    const kept = await $.store.get(STORE_TALLIES)
+    if (isTallies(kept)) await update($, allTime, () => kept)
+
+    try {
+      const home = await $.env.get('HOME')
+      const config = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home ?? ''}/.claude`
+      transcript ??= transcriptPath(config, e.cwd, await $.session.id())
+    } catch (error) {
+      debug($, 'transcript path', error) // the name then waits for a prompt's event
+    }
+
+    await tick($)
+    // On the timer, not at each turn's end: the name's grep reads the whole
+    // transcript, and no turn should wait on it.
+    $.clock.every(60_000, () => {
+      void tick($)
+      void refreshAgents($)
+      void refreshSession($)
+    })
+    await refreshUsage($)
+    await refreshBreakdown($)
+    await refreshSession($)
+    await refreshAgents($)
+    await backfillLinks($, await $.clock.now())
+    if (e.isInteractive) void $.ui.open({ id: PANE, title: TITLE, rows: INLINE_ROWS })
+
+    return next(e)
+  })
+
+  // The transcript's own path, from the classic event that carries it.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    if (typeof e.transcript_path === 'string' && e.transcript_path !== '') {
+      transcript = e.transcript_path
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('session.measure', async ($, e, next) => {
+    await update($, snapshot, held => absorb(held, e))
+    if (e.changed.includes('context')) await refreshBreakdown($)
+
+    return next(e)
+  })
+
+  // ---- tool calls: MCP use, and what the session opens and closes ----
+
+  on('tool.call', async ($, e, next) => {
+    const tool = String(e.tool)
+    const use = mcpUse(tool)
+    if (use === undefined && !LINK_TOOLS.has(tool)) return next(e)
+
+    if (use !== undefined) {
+      await count($, use)
+      await update($, running, list => [...list, { id: e.tool_use_id, detail: use.detail }])
+    }
+    try {
+      const done = await next(e)
+      if (LINK_TOOLS.has(tool) && done.deny === undefined && done.isError !== true) {
+        const ops = linkOps(tool, e, done.result, await $.clock.now())
+        if (ops.length > 0) await update($, links, list => applyOps(list, ops))
+      }
+      return done
+    } finally {
+      if (use !== undefined) {
+        await update($, running, list => list.filter(call => call.id !== e.tool_use_id))
+      }
+    }
+  }).catch(($, e, next) => next(e)) // a HUD never stands in a tool call's way
+
+  // ---- skills, slash commands and subagents ----
+
+  on('skill.prompt', async ($, e, next) => {
+    const use = namedUse('skill', e.skill, e.pluginName)
+    const at = await $.clock.now()
+    // run by its own slash command: the command already counted the plugin
+    const isSameRun =
+      lastCommand !== undefined &&
+      at - lastCommand.at < SAME_RUN_MS &&
+      (lastCommand.name === e.skill || lastCommand.name.endsWith(`:${use.name}`) || lastCommand.name === use.name)
+    await count($, use, !isSameRun)
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('command.run', async ($, e, next) => {
+    if (e.command !== 'usage-hud') {
+      const info = (await $.command.list()).find(one => one.name === e.command)
+      if (info !== undefined && info.source !== 'builtin') {
+        lastCommand = { name: e.command, at: await $.clock.now() }
+        await count($, namedUse('command', e.command, info.plugin))
+      }
+    }
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    if (!('deny' in result && typeof result.deny === 'string')) {
+      await count($, namedUse('agent', e.subagentType))
+    }
+    await refreshAgents($)
+
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // ---- per-turn cost; agents' turns refresh the agent list ----
+
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      await refreshAgents($)
+      return next(e)
+    }
+    try {
+      const usage = await $.session.usage() // the plain call is free
+      turnStart = { turnId: e.turnId, usd: usage.cost?.usd ?? 0 }
+    } catch {
+      turnStart = undefined
+    }
+
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined) {
+      await refreshAgents($)
+      return result
+    }
+
+    const started = turnStart?.turnId === e.turnId ? turnStart.usd : undefined
+    turnStart = undefined
+    try {
+      const usage = await $.session.usage()
+      const total = usage.cost?.usd
+      const spent =
+        total !== undefined && started !== undefined ? Math.max(0, total - started) : undefined
+      await update($, snapshot, held =>
+        json({ ...absorb(held, usage), lastTurnUsd: spent, lastTurnMs: e.durationMs }),
+      )
+      if (isTurnToastOn && spent !== undefined && spent > 0) {
+        $.ui.toast(turnToastText(spent, e.durationMs, e.usage, e.isAborted), {
+          timeoutMs: TURN_TOAST_MS,
+        })
+      }
+    } catch (error) {
+      debug($, 'turn cost read', error)
+    }
+
+    return result
+  })
+
+  // ---- compaction: steer the summary, and log what it did ----
+
+  on('session.compact', async ($, e, next) => {
+    // Every trigger, `precompute` too: a summary computed ahead of time is
+    // the one the coming compaction keeps.
+    const steered =
+      compactInstructions === ''
+        ? e
+        : {
+            ...e,
+            instructions: e.instructions
+              ? `${e.instructions}\n\n${compactInstructions}`
+              : compactInstructions,
+          }
+
+    // Subagents compact their own transcripts: the HUD follows the main one.
+    if (e.trigger === 'precompute' || e.agentId !== undefined) return next(steered)
+
+    await update($, isCompacting, () => true)
+    try {
+      const result = await next(steered)
+      if (result.skip === undefined) {
+        const at = await $.clock.now()
+        const entry: HudCompaction = json({
+          at,
+          trigger: e.trigger,
+          before: result.tokensBefore,
+          after: result.tokensAfter,
+        })
+        await update($, compactions, list => [...list, entry].slice(-20))
+        // The context figure only moves with the next reply: show the drop now.
+        const after = result.tokensAfter
+        if (after !== undefined) {
+          await update($, snapshot, held =>
+            held.context === undefined
+              ? held
+              : json({
+                  ...held,
+                  context: {
+                    ...held.context,
+                    tokens: after,
+                    percent: held.context.window > 0
+                      ? Math.round((after / held.context.window) * 100)
+                      : held.context.percent,
+                  },
+                }),
+          )
+        }
+        await refreshBreakdown($)
+      }
+
+      return result
+    } finally {
+      await update($, isCompacting, () => false)
+    }
+  }).catch(($, e, next) => next(e)) // a HUD never stands in a compaction's way
+
+  // ---- rows: secrets masked before they are kept; tasks that ended ----
+
+  on('session.append', async ($, e, next) => {
+    // A background task's notification says when a shell or monitor ended.
+    if (e.origin.kind === 'task-notification') {
+      const text = e.message.content
+        .map(block => (typeof block.text === 'string' ? block.text : ''))
+        .join('\n')
+      const ended = endedTask(text)
+      if (ended !== undefined) await update($, links, list => applyOps(list, [{ remove: ended }]))
+    }
+
+    if (!isMaskOn) return next(e)
+    const found: string[] = []
+    const content = e.message.content.map(block => maskBlock(block, found))
+    if (found.length === 0) return next(e)
+
+    const stored = await next({ ...e, message: { ...e.message, content } })
+    await update($, masked, n => n + found.length)
+    const kinds = [...new Set(found)].join(', ')
+    $.ui.toast(`masked ${found.length} secret${found.length > 1 ? 's' : ''}: ${kinds}`)
+
+    return stored
+  }).catch(($, e, next) => {
+    // Fails open: a row is never lost to this hook. Said in the debug log.
+    $.ui.log('usage-hud: append hook failed; the row was kept as made', { to: 'debug' })
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      await update($, compactions, () => [])
+      await update($, masked, () => 0)
+      await update($, tallies, () => [])
+      await update($, session, () => ({}))
+      await update($, snapshot, held =>
+        held.context === undefined ? held : { ...held, context: { window: held.context.window } },
+      )
+    }
+
+    return next(e)
+  })
+
+  // ---- the command and the pane ----
+
+  on('command.run', { command: 'usage-hud' }, async ($, e) => {
+    const arg = e.args.trim()
+    if (arg === 'close') {
+      await $.ui.close({ id: PANE })
+      return { text: 'Usage HUD closed.' }
+    }
+    let den = await read($, denominator)
+    if (arg !== '') {
+      const n = Number(arg)
+      if (!isDenominator(n)) {
+        return { text: 'Usage: /usage-hud [2-16 | close]. The top block takes 1/n of the screen.' }
+      }
+      den = n
+      await update($, denominator, () => n)
+      await $.store.set(STORE_DENOMINATOR, n)
+    }
+    const columns = dockColumns(e.presentation.columns, den)
+    askedColumns = columns
+    await $.ui.open({ id: PANE, title: TITLE, columns, rows: INLINE_ROWS })
+
+    return { text: `Usage HUD at 1/${den} of the screen (${columns} columns).` }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive] =
+      await Promise.all([
+        read($, snapshot),
+        read($, compactions),
+        read($, isCompacting),
+        read($, denominator),
+        read($, now),
+        read($, masked),
+        read($, breakdown),
+        read($, tallies),
+        read($, allTime),
+        read($, running),
+        read($, session),
+        read($, links),
+        read($, agents),
+      ])
+    const viewport = e.viewport
+    const isDock = e.props.placement === 'dock' && viewport !== undefined
+    const width = Math.max(16, e.props.bodyColumns)
+
+    // Docked, keep the dock at 1/den of the terminal's width. A width the
+    // person dragged the dock to still wins: the engine's rule, not ours.
+    if (isDock) {
+      const want = dockColumns(viewport.columns, den)
+      if (want !== askedColumns) {
+        askedColumns = want
+        $.ui.open({ id: PANE, title: TITLE, columns: want }).catch(() => undefined)
+      }
+    }
+
+    // Top: which session, then the block that takes 1/den of the height.
+    // Docked, the bottom holds what ending the session touches, and the
+    // middle the context mix and tool stats, as far as the room goes.
+    const topRows = isDock ? Math.max(MIN_ROWS, Math.round(viewport.rows / den)) : INLINE_ROWS
+    const upper = [
+      ...headerLines(sess, width),
+      ...hudLines(snap, log, busy, maskedCount, at, width).slice(0, topRows),
+    ]
+    let lines: Line[] = upper
+    if (isDock) {
+      const room = Math.max(upper.length, e.props.scroll.bodyRows)
+      const bottom = exitLines(open, alive, at, width)
+      const middleRoom = Math.max(0, room - upper.length - bottom.length)
+      const middle = [
+        ...breakdownLines(mix, width),
+        ...statsLines(calls, used, every, mix, width),
+      ].slice(0, middleRoom)
+      const gap: Line[] = Array.from({ length: middleRoom - middle.length }, () => [])
+      lines = [...upper, ...middle, ...gap, ...bottom].slice(0, room)
+    }
+
+    const copyOut = async (text: string) => {
+      const copied = await $.ui.copy({ text, surface: e.surface })
+      $.ui.toast(copied.isCopied ? `copied: ${text}` : 'could not copy here')
+    }
+
+    return (
+      <Box flexDirection="column">
+        {lines.map((runs, i) => {
+          const texts = fit(runs, width).map(run => (
+            <Text {...textStyle(run)}>{run.text}</Text>
+          ))
+          if (texts.length === 0) return <Text> </Text>
+          const copy = runs.find(run => run.copy !== undefined)?.copy
+          return copy === undefined ? (
+            <Box flexDirection="row">{texts}</Box>
+          ) : (
+            <Button key={`copy-${i}`} plain onPress={() => void copyOut(copy)}>
+              {texts}
+            </Button>
+          )
+        })}
+      </Box>
+    )
+  })
+}

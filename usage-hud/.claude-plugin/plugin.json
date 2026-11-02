@@ -1,0 +1,26 @@
+{
+  "name": "usage-hud",
+  "version": "0.2.0",
+  "description": "A small top-right HUD for context fill, auto-compaction, rate limits and cost; also steers compaction summaries, toasts each turn's cost and masks secrets",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "compactInstructions": {
+      "type": "string",
+      "title": "Compaction instructions",
+      "description": "Added to every compaction's summary instructions (after any you type with /compact). Empty adds nothing.",
+      "default": "In the summary, keep: (1) every file created, edited or deleted, with its path and what changed; (2) the user's explicit requests, preferences and corrections, verbatim where short; (3) decisions made and why, including approaches rejected; (4) errors hit and how they were fixed; (5) open TODOs and the exact next step."
+    },
+    "turnToast": {
+      "type": "boolean",
+      "title": "Turn cost toast",
+      "description": "After each turn, a toast with what it cost, how long it took and the tokens it wrote.",
+      "default": true
+    },
+    "maskSecrets": {
+      "type": "boolean",
+      "title": "Mask secrets",
+      "description": "Mask known key and token formats out of every row before the session keeps it, so the model and later requests never see them.",
+      "default": true
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "personal-mods",
+  "owner": { "name": "onlyarche" },
+  "plugins": [
+    {
+      "name": "usage-hud",
+      "source": "./usage-hud",
+      "description": "A top-right HUD for context fill, auto-compaction, rate limits, cost, tool stats and what ending the session touches"
+    }
+  ]
+}

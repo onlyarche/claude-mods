@@ -14,7 +14,7 @@ A small HUD docked in the top-right corner of a fullscreen Claude Code session:
 
 Under each prompt you type, a card lists what went to the model with it: `@` files, CLAUDE.md and the other first-message blocks, nested memory, settings-hook and plugin context, engine reminders and pasted images, each with an estimated token count. The HUD's prompt section lists every item of the last one; click an item to open its details (its type, who sent it, its size and the head of its text). Click a section's title (prompt, context mix, tools) to fold it; folded sections stay folded. When the HUD is taller than the dock, click it and scroll.
 
-It also adds instructions to every compaction's summary, toasts each turn's cost and duration, and masks known key and token formats out of every row before the session keeps it. Each of these is an option in `/config`.
+It also adds instructions to every compaction's summary (what to keep so work resumes without redoing anything: the goal and next step, your instructions verbatim, files changed, decisions, errors and fixes, outside changes, open promises; an empty option uses these, `off` turns them off), toasts each turn's cost and duration, and masks known key and token formats out of every row before the session keeps it. Each of these is an option in `/config`.
 
 `/usage-hud` opens it; `/usage-hud 6` sizes its top block to 1/6 of the screen (2–16, default 8); `/usage-hud close` closes it. It opens by itself in a fullscreen terminal at least 144 columns wide.
 

@@ -25,6 +25,9 @@ const MEASURE = {
 
 const TRANSCRIPT = [{ role: 'user', text: 'summary', toolUses: [] }] as const
 
+/** The manifest's default instructions, as one test reads them for another. */
+let manifestKeep: string | undefined
+
 const category = (name: string, tokens: number, kind = 'used') =>
   ({ name, tokens, kind, color: 'text', isDeferred: kind === 'deferred' })
 
@@ -128,8 +131,9 @@ test('compaction is told what to keep, after what /compact was told', async ($, 
   })
   await $.session.compact({ trigger: 'precompute', messages: TRANSCRIPT })
 
-  expect(told[0]).toMatch(/^focus on the API\n\nIn the summary, keep:/)
-  expect(told[1]).toMatch(/^In the summary, keep:/)
+  expect(told[0]).toMatch(/^focus on the API\n\nWrite the summary so the work can resume/)
+  expect(told[1]).toMatch(/^Write the summary so the work can resume/)
+  manifestKeep = told[1]
 })
 
 test('a secret is masked before the row is kept', async ($, on) => {
@@ -242,4 +246,32 @@ test('MCP calls and skills are counted per server, skill and plugin', async ($, 
   expect(await texts(/^dataviz$/)).toHaveLength(2) // session and all time
   expect(await texts(/^(small-business| · viz)$/)).toContain('small-business')
   await ui.unmount()
+})
+
+const toldWith = async ($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  const told: Array<string | undefined> = []
+  on('session.compact', (_, e) => {
+    told.push(e.instructions)
+    return { messages: TRANSCRIPT }
+  })
+  on('clock.now', () => ({ value: 1_700_000_000_000 }))
+  await $.session.compact({ trigger: 'manual', messages: TRANSCRIPT })
+  return told[0]
+}
+
+test('an empty instructions option still keeps the essentials', { options: { compactInstructions: '' } }, async ($, on) => {
+  // an install screen that shows no default can store an empty value: the
+  // code's fallback then stands in, and it must be the manifest's default word
+  // for word (the test above read that one with the option left unset)
+  const told = await toldWith($, on)
+  expect(told).toMatch(/^Write the summary so the work can resume/)
+  expect(told).toBe(manifestKeep)
+})
+
+test('off drops the instructions', { options: { compactInstructions: 'off' } }, async ($, on) => {
+  expect(await toldWith($, on)).toBeUndefined()
+})
+
+test('your own instructions replace the built-in ones', { options: { compactInstructions: 'Keep the API decisions.' } }, async ($, on) => {
+  expect(await toldWith($, on)).toBe('Keep the API decisions.')
 })

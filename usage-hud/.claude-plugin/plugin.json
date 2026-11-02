@@ -1,6 +1,6 @@
 {
   "name": "usage-hud",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A small top-right HUD for context fill, auto-compaction, rate limits and cost; shows what each prompt sent along, steers compaction summaries, toasts each turn's cost and masks secrets",
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -8,8 +8,8 @@
     "compactInstructions": {
       "type": "string",
       "title": "Compaction instructions",
-      "description": "Added to every compaction's summary instructions (after any you type with /compact). Empty adds nothing.",
-      "default": "In the summary, keep: (1) every file created, edited or deleted, with its path and what changed; (2) the user's explicit requests, preferences and corrections, verbatim where short; (3) decisions made and why, including approaches rejected; (4) errors hit and how they were fixed; (5) open TODOs and the exact next step."
+      "description": "Added to every compaction's summary instructions (after any you type with /compact). Left empty, the built-in instructions shown here are used; type off to add none.",
+      "default": "Write the summary so the work can resume without re-asking or redoing anything. Keep, with exact names (paths, symbols, commands, commit hashes, URLs):\n1. The goal, what is done, what is in progress, and the exact next step.\n2. Every explicit instruction, constraint, preference and correction from the user, quoted verbatim in the user's own language where short.\n3. Each file created, edited or deleted: its path, what changed and why.\n4. Decisions and their reasons, including approaches rejected and why, so they are not reopened.\n5. Errors and failed attempts, with the cause and the fix or workaround that worked.\n6. Facts the work depends on: how the code, tools and APIs actually behave, and the commands that build, test and run it.\n7. Anything changed outside the conversation: pushes, publishes, uploads, installs, running processes, with their identifiers.\n8. Open questions, and anything promised to the user but not yet done.\nDrop pleasantries, superseded plans, and tool output already acted on."
     },
     "turnToast": {
       "type": "boolean",

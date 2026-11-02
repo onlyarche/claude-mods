@@ -33,6 +33,19 @@ const TITLE = 'Usage'
 const STORE_DENOMINATOR = 'denominator'
 const STORE_TALLIES = 'tallies'
 const STORE_FOLDED = 'folded'
+/** What every compaction's summary keeps, unless the option says otherwise. */
+const DEFAULT_KEEP = [
+  "Write the summary so the work can resume without re-asking or redoing anything. Keep, with exact names (paths, symbols, commands, commit hashes, URLs):",
+  "1. The goal, what is done, what is in progress, and the exact next step.",
+  "2. Every explicit instruction, constraint, preference and correction from the user, quoted verbatim in the user's own language where short.",
+  "3. Each file created, edited or deleted: its path, what changed and why.",
+  "4. Decisions and their reasons, including approaches rejected and why, so they are not reopened.",
+  "5. Errors and failed attempts, with the cause and the fix or workaround that worked.",
+  "6. Facts the work depends on: how the code, tools and APIs actually behave, and the commands that build, test and run it.",
+  "7. Anything changed outside the conversation: pushes, publishes, uploads, installs, running processes, with their identifiers.",
+  "8. Open questions, and anything promised to the user but not yet done.",
+  "Drop pleasantries, superseded plans, and tool output already acted on.",
+].join('\n')
 const SECTIONS = new Set(['prompt', 'mix', 'tools'])
 const DEFAULT_DENOMINATOR = 8
 /** Fewest rows the top block draws, however small 1/n of the screen is. */
@@ -334,8 +347,14 @@ const textStyle = (run: Line[number]) => ({
 // ---- hooks ---------------------------------------------------------------
 
 export const register: Register = (on, options) => {
-  const compactInstructions =
+  // An install screen that shows no default can store an empty value; an
+  // empty value still keeps the summary's essentials. Only `off` drops them.
+  const typedInstructions =
     typeof options.compactInstructions === 'string' ? options.compactInstructions.trim() : ''
+  const compactInstructions =
+    typedInstructions.toLowerCase() === 'off' ? ''
+      : typedInstructions === '' ? DEFAULT_KEEP
+        : typedInstructions
   const isTurnToastOn = options.turnToast !== false
   const isMaskOn = options.maskSecrets !== false
   const isPromptCardOn = options.promptContext !== false

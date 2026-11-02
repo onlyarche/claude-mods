@@ -43,6 +43,22 @@ export type HudBreakdown = {
   /** MCP servers whose tools are in the context, and skills listed. */
   mcpServers: number
   skills: number
+  // What a click on a context mix row or the tools' `loaded` line opens:
+  /** The engine's own rows (/context's), each with the group it folds into. */
+  rows?: { name: string; tokens: number; group: keyof HudGroups }[]
+  /** Each MCP server: its tools, how many are loaded, their tokens; most first. */
+  servers?: { name: string; tools: number; loaded: number; tokens: number }[]
+  memoryFiles?: { path: string; tokens: number }[]
+  /** Custom agent types the Agent tool describes, most tokens first. */
+  agentTypes?: { name: string; tokens: number }[]
+  /** The skills listed, most tokens first (the first 40), and their totals. */
+  skillList?: { name: string; plugin?: string; tokens: number }[]
+  skillsTotal?: number
+  skillTokens?: number
+  commands?: { listed: number; total: number; tokens: number }
+  /** The window the breakdown measures against, and where auto-compact runs. */
+  window?: number
+  compactAt?: number
 }
 
 /** How often a server, skill, command, agent type or plugin was used. */
@@ -139,6 +155,8 @@ declare module 'claude-code' {
       picked: Shaped<HudPick>
       /** The HUD's folded sections: `prompt`, `mix`, `tools`. */
       folded: string[]
+      /** The context mix or tools row whose details are open (`mix:mcp`), or ''. */
+      opened: string
     }
   }
 }

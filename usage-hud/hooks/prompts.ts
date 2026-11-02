@@ -3,7 +3,7 @@
  * block the engine, a settings hook or a plugin sent alongside it.
  */
 import type { HudCtxItem, HudPromptCard } from '../types'
-import { cells, fit, padCells, sectionRule, tokens, wrapCells } from './draw'
+import { cells, detailRow, fit, padCells, sectionRule, tokens, wrapCells } from './draw'
 import type { Line } from './draw'
 import { THEME } from './palette'
 
@@ -185,6 +185,9 @@ function detailLines(item: HudCtxItem, width: number): Line[] {
     const shownChars = lines.slice(0, PREVIEW_LINES).join('').length
     const rest = (item.chars ?? item.preview.length) - shownChars
     if (rest > 0) out.push(fit([bar, { text: `… ${grouped(rest)}자 더`, color: ink.muted }], width))
+    // what was kept of it, whole: the preview's head, at most PREVIEW_CHARS
+    const isWhole = (item.chars ?? 0) <= item.preview.length
+    out.push(detailRow(isWhole ? '내용 복사' : `내용 복사 (앞 ${grouped(item.preview.length)}자)`, '', width, item.preview))
   }
   return out
 }

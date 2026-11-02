@@ -27,6 +27,8 @@ export type Action =
   | { copy: string }
   | { select: { card: string; index: number } }
   | { toggle: string }
+  /** open (or close) a context mix or tools row's details: `mix:mcp`, `tools:agent` */
+  | { open: string }
 
 /** A colored run; `action` makes its whole line a button. */
 export type Run = { text: string; color?: string; bold?: boolean; action?: Action }
@@ -143,6 +145,42 @@ export function wrapCells(text: string, width: number): string[] {
   return out
 }
 
+// ---- details: what a click on a row opens under it -----------------------
+
+const BAR = '  ┊ '
+
+/**
+ * One line of details: a name and its figure. Given a value to copy, it is a
+ * button that copies it, marked ⧉ where the others show ┊.
+ */
+export function detailRow(name: string, figure: string, width: number, copy?: string): Line {
+  const room = Math.max(6, width - 4 - (figure === '' ? 0 : figure.length + 1))
+  const cut = cells(name) > room ? `${head(name, room - 1)}…` : name
+  return [
+    copy !== undefined
+      ? { text: '  ⧉ ', color: THEME.status.ok, bold: true, action: { copy } }
+      : { text: BAR, color: ink.muted },
+    { text: padCells(cut, room), color: ink.text },
+    ...(figure === '' ? [] : [{ text: ` ${figure}`, color: ink.muted }]),
+  ]
+}
+
+/** A muted note in the details, wrapped to the width. */
+export const detailNote = (text: string, width: number): Line[] =>
+  wrapCells(text, Math.max(8, width - 4)).map(part => [
+    { text: BAR, color: ink.muted },
+    { text: part, color: ink.muted },
+  ])
+
+/** The first `most` of a list as detail lines, then how many more there are. */
+function listed<T>(items: readonly T[], line: (item: T) => Line, width: number, most = 12): Line[] {
+  const out = items.slice(0, most).map(line)
+  if (items.length > most) out.push(...detailNote(`+${items.length - most}개 더`, width))
+  return out
+}
+
+const shortPath = (path: string) => path.split('/').filter(Boolean).slice(-2).join('/')
+
 /** `── title ─────`, a section's rule, `width` wide. */
 export const rule = (title: string, width: number): Line => [
   { text: `── ${title} ${'─'.repeat(Math.max(0, width - title.length - 4))}`, color: ink.muted },
@@ -210,7 +248,7 @@ export function headerLines(session: HudSession, build: HudBuild, width: number)
   const out: Line[] = []
   const tag = buildTag(build)
   if (session.name !== undefined) {
-    out.push(fit([{ text: session.name, color: ink.label, bold: true }], width))
+    out.push(fit([{ text: session.name, color: ink.label, bold: true, action: { copy: session.name } }], width))
   }
   if (session.id !== undefined) {
     const copy = `claude --resume ${session.id}`
@@ -314,17 +352,18 @@ export function hudLines(
 
 // ---- the context mix: a stacked bar and its legend -----------------------
 
-type Group = { key: keyof HudGroups; label: string; color: string; glyph: string }
+/** `color` is read at draw time: the person's theme may change it after load. */
+type Group = { key: keyof HudGroups; label: string; color: () => string; glyph: string }
 
 /** Fixed order, fixed colors: a group keeps its color whatever is present. */
 export const GROUPS: readonly Group[] = [
-  { key: 'system', label: 'system', color: series.system, glyph: '█' },
-  { key: 'mcp', label: 'MCP tools', color: series.mcp, glyph: '█' },
-  { key: 'memory', label: 'memory', color: series.memory, glyph: '█' },
-  { key: 'other', label: 'agents·skills', color: series.other, glyph: '█' },
-  { key: 'messages', label: 'messages', color: series.messages, glyph: '█' },
-  { key: 'buffer', label: 'compact buffer', color: ink.buffer, glyph: '▒' },
-  { key: 'free', label: 'free', color: ink.track, glyph: '░' },
+  { key: 'system', label: 'system', color: () => series.system, glyph: '█' },
+  { key: 'mcp', label: 'MCP tools', color: () => series.mcp, glyph: '█' },
+  { key: 'memory', label: 'memory', color: () => series.memory, glyph: '█' },
+  { key: 'other', label: 'agents·skills', color: () => series.other, glyph: '█' },
+  { key: 'messages', label: 'messages', color: () => series.messages, glyph: '█' },
+  { key: 'buffer', label: 'compact buffer', color: () => ink.buffer, glyph: '▒' },
+  { key: 'free', label: 'free', color: () => ink.track, glyph: '░' },
 ]
 
 /** Splits `cells` in proportion to `values`, largest remainders first. */
@@ -345,7 +384,65 @@ function allocate(values: number[], cells: number): number[] {
   return out
 }
 
-export function breakdownLines(b: HudBreakdown, width: number, isFolded = false): Line[] {
+/** What a click on a context mix row opens: the breakdown behind the group. */
+function mixDetail(b: HudBreakdown, key: keyof HudGroups, width: number): Line[] {
+  const rowsOf = (group: keyof HudGroups) => (b.rows ?? []).filter(row => row.group === group)
+  const engineRows = (group: keyof HudGroups) =>
+    listed(rowsOf(group), row => detailRow(row.name, tokens(row.tokens), width), width)
+  const used = (Object.keys(b.groups) as (keyof HudGroups)[])
+    .filter(name => name !== 'free' && name !== 'buffer')
+    .reduce((sum, name) => sum + b.groups[name], 0)
+  const compactLine = b.compactAt !== undefined ? [detailRow('자동 압축 시점', tokens(b.compactAt), width)] : []
+
+  switch (key) {
+    case 'system':
+      return [...detailNote('시스템 프롬프트와 기본 도구 설명. 세션 내내 거의 그대로입니다.', width), ...engineRows('system')]
+    case 'mcp': {
+      const servers = b.servers ?? []
+      return [
+        ...detailNote(`MCP 서버 ${servers.length}개의 도구 설명 (로드된 도구/전체). 지연 로딩 도구는 쓰기 전까지 세지 않습니다. ⧉ 서버 이름 복사`, width),
+        ...listed(servers, s => detailRow(`${s.name} ${s.loaded}/${s.tools}`, tokens(s.tokens), width, s.name), width),
+      ]
+    }
+    case 'memory':
+      return [
+        ...detailNote('CLAUDE.md 같은 메모리 파일. ⧉ 전체 경로 복사', width),
+        ...listed(b.memoryFiles ?? [], f => detailRow(shortPath(f.path), tokens(f.tokens), width, f.path), width),
+      ]
+    case 'other': {
+      const named = (s: { name: string; plugin?: string }) => (s.plugin !== undefined ? `${s.plugin}:${s.name}` : s.name)
+      return [
+        ...detailNote('서브에이전트 종류, skill, slash command 목록의 설명.', width),
+        ...engineRows('other'),
+        ...((b.agentTypes ?? []).length > 0 ? detailNote('agent 종류, 토큰 순 · ⧉ 이름 복사', width) : []),
+        ...listed(b.agentTypes ?? [], a => detailRow(a.name, tokens(a.tokens), width, a.name), width, 6),
+        ...((b.skillList ?? []).length > 0
+          ? detailNote(`skill ${b.skills}/${b.skillsTotal ?? b.skills}개 나열${b.skillTokens !== undefined ? ` ≈${tokens(b.skillTokens)}` : ''}, 토큰 순 · ⧉ 이름 복사`, width)
+          : []),
+        ...listed(b.skillList ?? [], s => detailRow(named(s), tokens(s.tokens), width, named(s)), width, 8),
+        ...(b.commands !== undefined
+          ? [detailRow(`slash command ${b.commands.listed}/${b.commands.total}`, tokens(b.commands.tokens), width)]
+          : []),
+      ]
+    }
+    case 'messages':
+      return [
+        ...detailNote('대화 내용: 프롬프트, 응답, tool 결과. 대화가 길어질수록 늘고, 압축하면 줄어듭니다.', width),
+        ...engineRows('messages'),
+        ...compactLine,
+      ]
+    case 'buffer':
+      return [...detailNote('자동 압축이 돌 수 있도록 비워 두는 몫. 대화가 이 몫에 닿기 전에 압축이 시작됩니다.', width), ...compactLine]
+    case 'free':
+      return [
+        ...detailNote('아직 비어 있는 공간.', width),
+        ...(b.compactAt !== undefined ? [detailRow('압축까지 남음', tokens(Math.max(0, b.compactAt - used)), width)] : []),
+        ...(b.window !== undefined ? [detailRow('전체 window', tokens(b.window), width)] : []),
+      ]
+  }
+}
+
+export function breakdownLines(b: HudBreakdown, width: number, isFolded = false, opened = ''): Line[] {
   if (!b.isMeasured) return []
   const values = GROUPS.map(g => b.groups[g.key])
   const total = values.reduce((sum, v) => sum + v, 0)
@@ -356,24 +453,28 @@ export function breakdownLines(b: HudBreakdown, width: number, isFolded = false)
   const cells = allocate(values, width)
   const stacked: Line = GROUPS.flatMap((g, i) => {
     const n = cells[i] ?? 0
-    return n > 0 ? [{ text: g.glyph.repeat(n), color: g.color }] : []
+    return n > 0 ? [{ text: g.glyph.repeat(n), color: g.color() }] : []
   })
 
+  // each row a button: a click opens its breakdown under it, another closes it
   const nameWidth = Math.max(6, width - 2 - 6 - 5)
   const legend: Line[] = GROUPS.flatMap(g => {
     const value = b.groups[g.key]
     if (value <= 0) return []
     const share = Math.round((value / total) * 100)
+    const key = `mix:${g.key}`
+    const isOpen = opened === key
     return [
       fit(
         [
-          { text: `${g.glyph === '█' ? '■' : g.glyph} `, color: g.color },
-          { text: g.label.slice(0, nameWidth).padEnd(nameWidth), color: ink.text },
+          { text: `${g.glyph === '█' ? '■' : g.glyph} `, color: g.color(), action: { open: key } },
+          { text: g.label.slice(0, nameWidth).padEnd(nameWidth), color: ink.text, bold: isOpen },
           { text: tokens(value).padStart(6), color: ink.muted },
           { text: `${String(share).padStart(4)}%`, color: ink.muted },
         ],
         width,
       ),
+      ...(isOpen ? mixDetail(b, g.key, width) : []),
     ]
   })
 
@@ -390,12 +491,60 @@ const KIND_LABEL = {
   plugin: 'plugin',
 } as const
 
-/** One row per kind: its most used, as many as fit whole, most first. */
-function tallyRows(list: HudTally[], width: number): Line[] {
+/** What copying a used thing gives: the name you would type or look up. */
+function copyName(one: HudTally): string {
+  const full = one.plugin !== undefined && one.kind !== 'mcp' && one.kind !== 'plugin' ? `${one.plugin}:${one.name}` : one.name
+  return one.kind === 'command' || one.kind === 'skill' ? `/${full}` : full
+}
+
+/** What a click on a tools row opens: every one of that kind, most used first. */
+function toolDetail(list: HudTally[], kind: HudTally['kind'], width: number, alive: readonly HudAgent[]): Line[] {
+  const out: Line[] = []
+  if (kind === 'agent' && alive.length > 0) {
+    out.push(...detailNote(`지금 실행 중 ${alive.length}개 · ⧉ agent id 복사`, width))
+    out.push(...listed(alive, a => detailRow(`${a.type}: ${a.description}`, a.status, width, a.id), width, 5))
+  }
+  const all = top(list, kind, 500)
+  out.push(...detailNote(`${all.length}개, 많이 쓴 순 · ⧉ 이름 복사`, width))
+  if (kind !== 'plugin') {
+    out.push(...listed(all, one => detailRow(one.plugin !== undefined ? `${one.name} · ${one.plugin}` : one.name, String(one.calls), width, copyName(one)), width, 15))
+    return out
+  }
+  // a plugin: its count, then what of it was used
+  for (const plugin of all.slice(0, 8)) {
+    out.push(detailRow(plugin.name, String(plugin.calls), width, plugin.name))
+    const parts = list.filter(one => one.kind !== 'plugin' && one.plugin === plugin.name).sort((a, b) => b.calls - a.calls)
+    out.push(...listed(parts, one => detailRow(`  ${KIND_LABEL[one.kind]} ${one.name}`, String(one.calls), width), width, 4))
+  }
+  if (all.length > 8) out.push(...detailNote(`+${all.length - 8}개 더`, width))
+  return out
+}
+
+/** What a click on `loaded` opens: the MCP servers and skills the context lists. */
+function loadedDetail(b: HudBreakdown, width: number): Line[] {
+  const named = (s: { name: string; plugin?: string }) => (s.plugin !== undefined ? `${s.plugin}:${s.name}` : s.name)
+  return [
+    ...detailNote(`MCP 서버 ${b.mcpServers}개 (로드된 도구/전체), 토큰 순 · ⧉ 이름 복사`, width),
+    ...listed(b.servers ?? [], s => detailRow(`${s.name} ${s.loaded}/${s.tools}`, tokens(s.tokens), width, s.name), width, 10),
+    ...detailNote(`skill ${b.skills}/${b.skillsTotal ?? b.skills}개 나열${b.skillTokens !== undefined ? ` ≈${tokens(b.skillTokens)}` : ''}, 토큰 순`, width),
+    ...listed(b.skillList ?? [], s => detailRow(named(s), tokens(s.tokens), width, `/${named(s)}`), width, 8),
+    ...(b.commands !== undefined
+      ? [detailRow(`slash command ${b.commands.listed}/${b.commands.total}`, tokens(b.commands.tokens), width)]
+      : []),
+  ]
+}
+
+/**
+ * One row per kind: its most used, as many as fit whole, most first. Each
+ * row a button: a click opens every one of its kind under it.
+ */
+function tallyRows(list: HudTally[], width: number, scope: string, opened: string, alive: readonly HudAgent[]): Line[] {
   return (['mcp', 'skill', 'command', 'agent', 'plugin'] as const).flatMap(kind => {
     const best = top(list, kind, 5)
     if (best.length === 0) return []
-    const runs: Line = [{ text: KIND_LABEL[kind].padEnd(7), color: ink.label }]
+    const key = `${scope}:${kind}`
+    const isOpen = opened === key
+    const runs: Line = [{ text: KIND_LABEL[kind].padEnd(7), color: ink.label, bold: isOpen, action: { open: key } }]
     let used = 7
     for (const [i, one] of best.entries()) {
       const name = `${i > 0 ? ' · ' : ''}${one.name}`
@@ -405,7 +554,7 @@ function tallyRows(list: HudTally[], width: number): Line[] {
       runs.push({ text: name, color: ink.text }, { text: calls, color: ink.muted })
       used += name.length + calls.length
     }
-    return [fit(runs, width)]
+    return [fit(runs, width), ...(isOpen ? toolDetail(list, kind, width, alive) : [])]
   })
 }
 
@@ -416,24 +565,28 @@ export function statsLines(
   b: HudBreakdown,
   width: number,
   isFolded = false,
+  opened = '',
+  alive: readonly HudAgent[] = [],
 ): Line[] {
   const out: Line[] = [sectionRule('tools', 'tools · session', isFolded, width)]
   if (isFolded) return out
   for (const call of running.slice(-3)) {
     out.push(fit([
-      { text: '⟳ ', color: THEME.status.ok, bold: true },
+      { text: '⟳ ', color: THEME.status.ok, bold: true, action: { copy: call.detail } },
       { text: call.detail, color: ink.text },
     ], width))
   }
-  const sessionRows = tallyRows(session, width)
+  const sessionRows = tallyRows(session, width, 'tools', opened, alive)
   out.push(...(sessionRows.length > 0
     ? sessionRows
     : [fit([{ text: 'nothing used yet', color: ink.muted }], width)]))
   if (b.isMeasured && (b.mcpServers > 0 || b.skills > 0)) {
-    out.push(fit([{ text: `loaded ${b.mcpServers} mcp · ${b.skills} skills`, color: ink.muted }], width))
+    const isOpen = opened === 'tools:loaded'
+    out.push(fit([{ text: `loaded ${b.mcpServers} mcp · ${b.skills} skills`, color: ink.muted, bold: isOpen, action: { open: 'tools:loaded' } }], width))
+    if (isOpen) out.push(...loadedDetail(b, width))
   }
 
-  const allRows = tallyRows(allTime, width)
+  const allRows = tallyRows(allTime, width, 'all', opened, [])
   if (allRows.length > 0) out.push(rule('tools · all time', width), ...allRows)
 
   return out
@@ -457,14 +610,14 @@ function exitItem(link: HudLink, at: number): ExitItem {
   const left = link.until !== undefined && at > 0 ? ` · in ${span(link.until - at)}` : ''
   switch (link.kind) {
     case 'shell':
-      return { kind: 'shell', label: link.label, effect: 'killed', stops: true }
+      return { kind: 'shell', label: link.label, effect: 'killed', stops: true, copy: link.id }
     case 'monitor':
-      return { kind: 'watch', label: `${link.label}${left}`, effect: 'killed', stops: true }
+      return { kind: 'watch', label: `${link.label}${left}`, effect: 'killed', stops: true, copy: link.id }
     case 'cron': {
       const label = link.detail !== undefined ? `${link.detail} · ${link.label}` : link.label
       return link.survives
-        ? { kind: 'cron', label, effect: 'stays', stops: false }
-        : { kind: 'cron', label: `${label}${left}`, effect: 'cancels', stops: true }
+        ? { kind: 'cron', label, effect: 'stays', stops: false, copy: link.id }
+        : { kind: 'cron', label: `${label}${left}`, effect: 'cancels', stops: true, copy: link.id }
     }
     case 'loop':
       return { kind: 'loop', label: `${link.label}${left}`, effect: 'cancels', stops: true }
@@ -476,7 +629,7 @@ function exitItem(link: HudLink, at: number): ExitItem {
     }
     case 'worktree':
       return link.detail !== undefined
-        ? { kind: 'tree', label: link.label, effect: 'asks', stops: false, sub: link.detail }
+        ? { kind: 'tree', label: link.label, effect: 'asks', stops: false, sub: link.detail, copy: link.detail }
         : { kind: 'tree', label: link.label, effect: 'asks', stops: false }
   }
 }
@@ -494,6 +647,7 @@ export function exitLines(links: HudLink[], agents: HudAgent[], at: number, widt
       label: a.description !== '' ? `${a.type}: ${a.description}` : a.type,
       effect: 'stops',
       stops: true,
+      copy: a.id,
     })),
     ...live(links, at).map(link => exitItem(link, at)),
   ]

@@ -1,6 +1,6 @@
 {
   "name": "usage-hud",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A small top-right HUD for context fill, auto-compaction, rate limits and cost; shows what each prompt sent along, steers compaction summaries, toasts each turn's cost and masks secrets",
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -28,6 +28,18 @@
       "title": "Prompt context card",
       "description": "Under each prompt you type, a card listing what went to the model with it: @ files, CLAUDE.md, hook and plugin context, engine reminders, pasted images, with estimated tokens.",
       "default": true
+    },
+    "themeColor": {
+      "type": "string",
+      "title": "Theme color",
+      "description": "The HUD's base color as #rrggbb: every other color is derived from it, keeping how each sits against it. Empty or #6266b7 keeps the default palette, the one checked for contrast and color blindness. /usage-hud colors shows the colors in force.",
+      "default": "#6266b7"
+    },
+    "colorOverrides": {
+      "type": "string",
+      "title": "Color overrides",
+      "description": "Single colors to set over the theme, as name=#rrggbb separated by commas, e.g. warn=#ff8800, surface=#000000. Names: surface (the HUD's background; surface=terminal keeps the terminal's own), ok, warn, high (gauges), system, mcp, memory, other, messages (context mix), text, muted, label, mark, buffer, track. Empty changes nothing.",
+      "default": ""
     }
   }
 }

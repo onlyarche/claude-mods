@@ -24,6 +24,7 @@ import {
 import type { Action, Line } from './draw'
 import { applyOps, endedTask, LINK_TOOLS, linkOps, titleFrom, transcriptPath } from './links'
 import { attachmentItem, cardLines, contextItems, estimateTokens, mediaItem, promptSection } from './prompts'
+import { applyTheme, COLOR_NAMES, currentColors, DEFAULT_BASE, parseHex, THEME } from './palette'
 import { maskBlock } from './secrets'
 import { bump, mcpUse, namedUse } from './stats'
 import type { Use } from './stats'
@@ -33,6 +34,16 @@ const TITLE = 'Usage'
 const STORE_DENOMINATOR = 'denominator'
 const STORE_TALLIES = 'tallies'
 const STORE_FOLDED = 'folded'
+/**
+ * What every open of the pane says: each open sets the background anew, so
+ * one that left it out would hand the HUD back to the terminal's own. Read
+ * at each open, as the person's theme set it (`surface=terminal`: none).
+ */
+const paneArgs = () => ({
+  id: PANE,
+  title: TITLE,
+  ...(THEME.surface !== undefined && { backgroundColor: THEME.surface }),
+})
 /** What every compaction's summary keeps, unless the option says otherwise. */
 const DEFAULT_KEEP = [
   "Write the summary so the work can resume without re-asking or redoing anything. Keep, with exact names (paths, symbols, commands, commit hashes, URLs):",
@@ -98,6 +109,7 @@ const prompts = atom({ plugin: 'usage-hud', key: 'prompts' } as const, [], { sha
 const build = atom({ plugin: 'usage-hud', key: 'build' } as const, {}, { shape: 'build-1' })
 const picked = atom({ plugin: 'usage-hud', key: 'picked' } as const, {}, { shape: 'picked-1' })
 const folded = atom({ plugin: 'usage-hud', key: 'folded' } as const, [] as string[])
+const opened = atom({ plugin: 'usage-hud', key: 'opened' } as const, '')
 
 /** Where this copy was loaded from, by its folder. */
 const sourceOf = (root: string): string =>
@@ -208,23 +220,63 @@ const dockColumns = (terminalColumns: number, den: number): number =>
     Math.min(Math.round(terminalColumns / den), Math.floor(terminalColumns * DOCK_MAX_SHARE)),
   )
 
+/** The HUD group one of /context's rows folds into. */
+function groupOf(c: ContextCategory): keyof HudGroups {
+  const name = c.name.toLowerCase()
+  return c.kind === 'free' ? 'free'
+    : c.kind === 'buffer' ? 'buffer'
+      : name.includes('mcp') ? 'mcp'
+        : name.includes('system') ? 'system'
+          : name.includes('memory') ? 'memory'
+            : name.includes('message') ? 'messages'
+              : 'other'
+}
+
 /** /context's rows, folded into the HUD's groups; deferred tools left out. */
 function group(categories: readonly ContextCategory[]): HudGroups {
   const groups = { ...NO_GROUPS }
   for (const c of categories) {
     if (c.kind === 'deferred' || c.isDeferred) continue
-    const name = c.name.toLowerCase()
-    const key: keyof HudGroups =
-      c.kind === 'free' ? 'free'
-        : c.kind === 'buffer' ? 'buffer'
-          : name.includes('mcp') ? 'mcp'
-            : name.includes('system') ? 'system'
-              : name.includes('memory') ? 'memory'
-                : name.includes('message') ? 'messages'
-                  : 'other'
-    groups[key] += c.tokens
+    groups[groupOf(c)] += c.tokens
   }
   return groups
+}
+
+const byTokens = <T extends { tokens: number }>(list: T[]) => [...list].sort((a, b) => b.tokens - a.tokens)
+
+/** What a click on a context mix row opens: the breakdown behind each group. */
+function mixDetails(b: NonNullable<SessionContextUsage['breakdown']>) {
+  const perServer = new Map<string, { tools: number; loaded: number; tokens: number }>()
+  for (const tool of b.mcpTools ?? []) {
+    const held = perServer.get(tool.serverName) ?? { tools: 0, loaded: 0, tokens: 0 }
+    held.tools += 1
+    // a deferred tool costs nothing until it is loaded
+    if (tool.isLoaded) {
+      held.loaded += 1
+      held.tokens += tool.tokens
+    }
+    perServer.set(tool.serverName, held)
+  }
+  return {
+    mcpServers: perServer.size,
+    rows: (b.categories ?? [])
+      .filter(c => !(c.kind === 'deferred' || c.isDeferred))
+      .map(c => ({ name: c.name, tokens: c.tokens, group: groupOf(c) })),
+    servers: [...perServer]
+      .map(([name, held]) => ({ name, ...held }))
+      .sort((x, y) => y.tokens - x.tokens || y.tools - x.tools)
+      .slice(0, 60),
+    memoryFiles: byTokens((b.memoryFiles ?? []).map(f => ({ path: f.path, tokens: f.tokens }))).slice(0, 30),
+    agentTypes: byTokens((b.agents ?? []).map(a => ({ name: a.agentType, tokens: a.tokens }))).slice(0, 40),
+    skillList: byTokens((b.skills?.skillFrontmatter ?? []).map(s => ({ name: s.name, plugin: s.pluginName, tokens: s.tokens }))).slice(0, 40),
+    skillsTotal: b.skills?.totalSkills,
+    skillTokens: b.skills?.tokens,
+    commands: b.slashCommands === undefined
+      ? undefined
+      : { listed: b.slashCommands.includedCommands, total: b.slashCommands.totalCommands, tokens: b.slashCommands.tokens },
+    window: b.rawMaxTokens,
+    compactAt: b.isAutoCompactEnabled ? b.autoCompactThreshold : undefined,
+  }
 }
 
 const debug = ($: EngineInterface, what: string, error: unknown) =>
@@ -251,11 +303,11 @@ async function refreshBreakdown($: EngineInterface): Promise<void> {
         isAutoCompactEnabled: b.isAutoCompactEnabled,
       }),
     )
-    await update($, breakdown, () => ({
+    await update($, breakdown, () => json({
       isMeasured: true,
-      groups: group(b.categories),
-      mcpServers: new Set(b.mcpTools.map(tool => tool.serverName)).size,
+      groups: group(b.categories ?? []),
       skills: b.skills?.includedSkills ?? 0,
+      ...mixDetails(b),
     }))
   } catch (error) {
     debug($, 'breakdown read', error)
@@ -339,6 +391,24 @@ function turnToastText(
   return parts.join(' · ')
 }
 
+/** `/usage-hud colors`: every color by the name an override takes, and how to change them. */
+function colorsText(themeColor: unknown, problems: readonly string[]): string {
+  const base = parseHex(themeColor)
+  const colors = currentColors()
+  const isDefault = base === undefined || base === DEFAULT_BASE
+  const row = (title: string, names: readonly (typeof COLOR_NAMES)[number][]) =>
+    `${title}: ${names.map(name => `${name} ${colors[name] ?? 'terminal'}`).join(' · ')}`
+  return [
+    `usage-hud colors, theme ${base ?? DEFAULT_BASE}${isDefault ? ' (the validated default palette)' : ' (derived from it, not validated)'}`,
+    row('background', ['surface']),
+    row('gauges', ['ok', 'warn', 'high']),
+    row('context mix', ['system', 'mcp', 'memory', 'other', 'messages']),
+    row('text and marks', ['text', 'muted', 'label', 'mark', 'buffer', 'track']),
+    ...(problems.length > 0 ? [`not applied: ${problems.join('; ')}`] : []),
+    'Change them in /config: Theme color (#rrggbb, every color follows it), Color overrides (name=#rrggbb, comma separated; surface=terminal keeps the terminal\'s background).',
+  ].join('\n')
+}
+
 const textStyle = (run: Line[number]) => ({
   ...(run.color !== undefined && { color: run.color }),
   ...(run.bold === true && { bold: true }),
@@ -358,14 +428,20 @@ export const register: Register = (on, options) => {
   const isTurnToastOn = options.turnToast !== false
   const isMaskOn = options.maskSecrets !== false
   const isPromptCardOn = options.promptContext !== false
+  // The person's colors, before anything draws; a change in /config reloads
+  // the module with the new options, so it applies at once.
+  const colorProblems = applyTheme(options.themeColor, options.colorOverrides)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-hud',
       description: 'Open the usage HUD, or size it: /usage-hud 6 takes 1/6 of the screen',
-      argumentHint: '[2-16 | close | version]',
+      argumentHint: '[2-16 | close | version | colors]',
     })
     await readBuild($)
+    if (colorProblems.length > 0) {
+      $.ui.toast(`usage-hud colors: ${colorProblems.join('; ')}`, { timeoutMs: 10_000 })
+    }
     // folded sections stay folded across sessions
     const keptFolds = await $.store.get(STORE_FOLDED)
     if (Array.isArray(keptFolds)) {
@@ -398,7 +474,7 @@ export const register: Register = (on, options) => {
     await refreshSession($)
     await refreshAgents($)
     await backfillLinks($, await $.clock.now())
-    if (e.isInteractive) void $.ui.open({ id: PANE, title: TITLE, rows: INLINE_ROWS })
+    if (e.isInteractive) void $.ui.open({ ...paneArgs(), rows: INLINE_ROWS })
 
     return next(e)
   })
@@ -712,11 +788,12 @@ export const register: Register = (on, options) => {
       const version = held.version !== undefined ? `usage-hud ${held.version}` : 'usage-hud (version unknown)'
       return { text: `${version}, loaded from ${held.source ?? sourceOf($.plugin.root)}: ${$.plugin.root}` }
     }
+    if (arg === 'colors') return { text: colorsText(options.themeColor, colorProblems) }
     let den = await read($, denominator)
     if (arg !== '') {
       const n = Number(arg)
       if (!isDenominator(n)) {
-        return { text: 'Usage: /usage-hud [2-16 | close | version]. The top block takes 1/n of the screen.' }
+        return { text: 'Usage: /usage-hud [2-16 | close | version | colors]. The top block takes 1/n of the screen.' }
       }
       den = n
       await update($, denominator, () => n)
@@ -724,14 +801,14 @@ export const register: Register = (on, options) => {
     }
     const columns = dockColumns(e.presentation.columns, den)
     askedColumns = columns
-    await $.ui.open({ id: PANE, title: TITLE, columns, rows: INLINE_ROWS })
+    await $.ui.open({ ...paneArgs(), columns, rows: INLINE_ROWS })
 
     return { text: `Usage HUD at 1/${den} of the screen (${columns} columns).` }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive, typed, held, pick0, folds] =
+    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive, typed, held, pick0, folds, details] =
       await Promise.all([
         read($, snapshot),
         read($, compactions),
@@ -750,6 +827,7 @@ export const register: Register = (on, options) => {
         read($, build),
         read($, picked),
         read($, folded),
+        read($, opened),
       ])
     const viewport = e.viewport
     const isDock = e.props.placement === 'dock' && viewport !== undefined
@@ -761,7 +839,7 @@ export const register: Register = (on, options) => {
       const want = dockColumns(viewport.columns, den)
       if (want !== askedColumns) {
         askedColumns = want
-        $.ui.open({ id: PANE, title: TITLE, columns: want }).catch(() => undefined)
+        $.ui.open({ ...paneArgs(), columns: want }).catch(() => undefined)
       }
     }
 
@@ -782,8 +860,8 @@ export const register: Register = (on, options) => {
       const room = Math.max(upper.length, e.props.scroll.bodyRows)
       const middle = [
         ...promptSection(card, pick, isFolded('prompt'), width),
-        ...breakdownLines(mix, width, isFolded('mix')),
-        ...statsLines(calls, used, every, mix, width, isFolded('tools')),
+        ...breakdownLines(mix, width, isFolded('mix'), details),
+        ...statsLines(calls, used, every, mix, width, isFolded('tools'), details, alive),
       ]
       const bottom = exitLines(open, alive, at, width)
       const spare = room - upper.length - middle.length - bottom.length
@@ -809,6 +887,8 @@ export const register: Register = (on, options) => {
           now.card === id && now.index === index ? {} : { card: id, index },
         )
       }
+      // one row's details open at a time: the dock has little room
+      if ('open' in action) return void update($, opened, now => (now === action.open ? '' : action.open))
       // `update` may run its change again on a race, so the save follows it
       return void update($, folded, now =>
         now.includes(action.toggle) ? now.filter(one => one !== action.toggle) : [...now, action.toggle],
@@ -820,7 +900,8 @@ export const register: Register = (on, options) => {
     const keyOf = (action: Action, i: number) =>
       'copy' in action ? `copy-${i}`
         : 'select' in action ? `item-${action.select.card}-${action.select.index}`
-          : `toggle-${action.toggle}`
+          : 'open' in action ? `open-${action.open}`
+            : `toggle-${action.toggle}`
 
     return (
       <Box flexDirection="column">

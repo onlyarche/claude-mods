@@ -19,13 +19,16 @@ const PANE = {
 } as const
 
 /** Everything a session start asks of the engine, answered from memory. */
-function boot(on: On, seen: { argv?: readonly string[] } = {}) {
+function boot(on: On, seen: { argv?: readonly string[]; opens?: unknown[] } = {}) {
   mock.clock(on)
   mock.store(on)
   mock.env(on, { HOME: '/Users/me' })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'usage-hud' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    seen.opens = [...(seen.opens ?? []), e]
+    return { value: { isPlaced: true } }
+  })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000 }, rateLimits: [] } as never }))
   on('session.id', () => ({ value: ID }))
   on('process.run', (_, e) => {
@@ -198,4 +201,24 @@ test('the header shows which build runs, and /usage-hud version says where from'
     presentation: { isFullscreen: true, columns: 200 },
   } as never)
   expect(String((said as { text?: string }).text)).toMatch(/^usage-hud 9\.9\.9, loaded from local: \/.+usage-hud$/)
+})
+
+test('every open of the HUD paints its own background, so it looks the same everywhere', async ($, on) => {
+  const seen: { opens?: unknown[] } = {}
+  boot(on, seen)
+  on('command.run', () => ({ text: 'beneath' }))
+
+  // the open at a session's start, the /usage-hud command's, and the one a
+  // drawing makes to keep the dock at 1/8 of the terminal's width
+  await $.session.start({ ...START, isInteractive: true })
+  await $.command.run({
+    command: 'usage-hud', args: '', origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 200 },
+  } as never)
+  const ui = await $.ui.mount({ ...PANE, viewport: { columns: 320, rows: 48, isFullscreen: true }, surface: 'terminal' })
+  await ui.unmount()
+
+  const opens = (seen.opens ?? []) as Array<{ backgroundColor?: string }>
+  expect(opens.length).toBeGreaterThan(2)
+  for (const open of opens) expect(open.backgroundColor).toBe('#15161c')
 })

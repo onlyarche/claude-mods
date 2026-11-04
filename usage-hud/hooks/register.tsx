@@ -24,7 +24,8 @@ import {
 import type { Action, Line } from './draw'
 import { applyOps, endedTask, LINK_TOOLS, linkOps, titleFrom, transcriptPath } from './links'
 import { attachmentItem, cardLines, contextItems, estimateTokens, mediaItem, promptSection } from './prompts'
-import { applyTheme, COLOR_NAMES, currentColors, DEFAULT_BASE, parseHex, THEME } from './palette'
+import { applyTheme, COLOR_NAMES, currentColors, DEFAULT_BASE, depthOverride, forTerminal, parseHex, shownOn, THEME } from './palette'
+import type { ColorDepth } from './palette'
 import { maskBlock } from './secrets'
 import { bump, mcpUse, namedUse } from './stats'
 import type { Use } from './stats'
@@ -39,10 +40,10 @@ const STORE_FOLDED = 'folded'
  * one that left it out would hand the HUD back to the terminal's own. Read
  * at each open, as the person's theme set it (`surface=terminal`: none).
  */
-const paneArgs = () => ({
+const paneArgs = (depth: ColorDepth) => ({
   id: PANE,
   title: TITLE,
-  ...(THEME.surface !== undefined && { backgroundColor: THEME.surface }),
+  ...(THEME.surface !== undefined && { backgroundColor: forTerminal(THEME.surface, depth) }),
 })
 /** What every compaction's summary keeps, unless the option says otherwise. */
 const DEFAULT_KEEP = [
@@ -110,6 +111,35 @@ const build = atom({ plugin: 'usage-hud', key: 'build' } as const, {}, { shape: 
 const picked = atom({ plugin: 'usage-hud', key: 'picked' } as const, {}, { shape: 'picked-1' })
 const folded = atom({ plugin: 'usage-hud', key: 'folded' } as const, [] as string[])
 const opened = atom({ plugin: 'usage-hud', key: 'opened' } as const, '')
+/** How many colors this terminal draws, as read at the session's start. */
+const depth = atom({ plugin: 'usage-hud', key: 'depth' } as const, 'truecolor' as string)
+const asDepth = (value: string): ColorDepth => (value === '256' || value === '16' ? value : 'truecolor')
+
+/**
+ * The terminal's color depth, by the signals chalk (what the engine paints
+ * with) reads: so the HUD hands it colors it will show as meant.
+ */
+async function readDepth($: EngineInterface): Promise<{ depth: ColorDepth; why: string }> {
+  if (depthOverride !== undefined) return { depth: depthOverride, why: 'set in Color overrides' }
+  // each name written out: the engine reads which variables a module asks for
+  const [force = '', colorterm = '', program = '', term = '', tmux = ''] = await Promise.all([
+    $.env.get('FORCE_COLOR'), $.env.get('COLORTERM'), $.env.get('TERM_PROGRAM'), $.env.get('TERM'), $.env.get('TMUX'),
+  ])
+  isInTmux = tmux !== ''
+  const said = [colorterm && `COLORTERM=${colorterm}`, program && `TERM_PROGRAM=${program}`, term && `TERM=${term}`]
+    .filter(Boolean).join(', ') || 'nothing said'
+  if (force === '3') return { depth: 'truecolor', why: 'FORCE_COLOR=3' }
+  if (force === '2') return { depth: '256', why: 'FORCE_COLOR=2' }
+  if (force === '1' || force === 'true') return { depth: '16', why: `FORCE_COLOR=${force}` }
+  if (/^(truecolor|24bit)$/i.test(colorterm)) return { depth: 'truecolor', why: said }
+  if (/^(xterm-kitty|xterm-ghostty|wezterm)$/.test(term) || program === 'iTerm.app') return { depth: 'truecolor', why: said }
+  if (program === 'Apple_Terminal' || /-256(color)?$/.test(term)) return { depth: '256', why: said }
+  return { depth: '16', why: said }
+}
+// why the depth is what it is, for /usage-hud colors
+let depthWhy = 'not read yet'
+// inside tmux, which passes 24-bit color only when told to
+let isInTmux = false
 
 /** Where this copy was loaded from, by its folder. */
 const sourceOf = (root: string): string =>
@@ -392,25 +422,41 @@ function turnToastText(
 }
 
 /** `/usage-hud colors`: every color by the name an override takes, and how to change them. */
-function colorsText(themeColor: unknown, problems: readonly string[]): string {
+function colorsText(themeColor: unknown, problems: readonly string[], terminal: ColorDepth): string {
   const base = parseHex(themeColor)
   const colors = currentColors()
   const isDefault = base === undefined || base === DEFAULT_BASE
+  // on a 256-color terminal, each color as it is shown there too
+  const shown = (hex: string | undefined) =>
+    hex === undefined ? 'terminal' : terminal === '256' ? `${hex}→${shownOn(hex, '256')}` : hex
   const row = (title: string, names: readonly (typeof COLOR_NAMES)[number][]) =>
-    `${title}: ${names.map(name => `${name} ${colors[name] ?? 'terminal'}`).join(' · ')}`
+    `${title}: ${names.map(name => `${name} ${shown(colors[name])}`).join(' · ')}`
+  const depthLine =
+    terminal === 'truecolor' ? `terminal: 24-bit color (${depthWhy}); colors shown as set`
+      : terminal === '256' ? `terminal: 256 colors (${depthWhy}); each color shown as the nearest of the 256 (set→shown)`
+        : `terminal: 16 colors (${depthWhy}); colors fall to the nearest of 16`
+  // the engine paints with as many colors as the environment says: only it
+  // can show the palette exactly, which depth= in the options cannot
+  const howExact = terminal === 'truecolor' ? []
+    : isInTmux
+      ? ['to show them exactly, let tmux pass 24-bit color: in ~/.tmux.conf `set -g default-terminal "tmux-256color"` and `set -as terminal-features ",*:RGB"`, `export COLORTERM=truecolor` in the shell profile, then restart tmux (tmux kill-server)']
+      : ['to show them exactly, `export COLORTERM=truecolor` in the shell profile, if the terminal draws 24-bit color']
   return [
     `usage-hud colors, theme ${base ?? DEFAULT_BASE}${isDefault ? ' (the validated default palette)' : ' (derived from it, not validated)'}`,
+    depthLine,
+    ...howExact,
     row('background', ['surface']),
     row('gauges', ['ok', 'warn', 'high']),
     row('context mix', ['system', 'mcp', 'memory', 'other', 'messages']),
     row('text and marks', ['text', 'muted', 'label', 'mark', 'buffer', 'track']),
     ...(problems.length > 0 ? [`not applied: ${problems.join('; ')}`] : []),
-    'Change them in /config: Theme color (#rrggbb, every color follows it), Color overrides (name=#rrggbb, comma separated; surface=terminal keeps the terminal\'s background).',
+    'Change them in /config: Theme color (#rrggbb, every color follows it), Color overrides (name=#rrggbb, comma separated; surface=terminal keeps the terminal\'s background; depth=truecolor|256|16 if this reads the terminal otherwise than the engine paints it).',
   ].join('\n')
 }
 
-const textStyle = (run: Line[number]) => ({
-  ...(run.color !== undefined && { color: run.color }),
+/** A run's style, its color as this terminal will show it as meant. */
+const textStyle = (run: Line[number], terminal: ColorDepth) => ({
+  ...(run.color !== undefined && { color: forTerminal(run.color, terminal) }),
   ...(run.bold === true && { bold: true }),
 })
 
@@ -439,6 +485,14 @@ export const register: Register = (on, options) => {
       argumentHint: '[2-16 | close | version | colors]',
     })
     await readBuild($)
+    // the terminal's color depth, before anything draws or the pane opens
+    try {
+      const read = await readDepth($)
+      depthWhy = read.why
+      await update($, depth, () => read.depth)
+    } catch (error) {
+      debug($, 'color depth read', error)
+    }
     if (colorProblems.length > 0) {
       $.ui.toast(`usage-hud colors: ${colorProblems.join('; ')}`, { timeoutMs: 10_000 })
     }
@@ -474,7 +528,7 @@ export const register: Register = (on, options) => {
     await refreshSession($)
     await refreshAgents($)
     await backfillLinks($, await $.clock.now())
-    if (e.isInteractive) void $.ui.open({ ...paneArgs(), rows: INLINE_ROWS })
+    if (e.isInteractive) void $.ui.open({ ...paneArgs(asDepth(await read($, depth))), rows: INLINE_ROWS })
 
     return next(e)
   })
@@ -788,7 +842,7 @@ export const register: Register = (on, options) => {
       const version = held.version !== undefined ? `usage-hud ${held.version}` : 'usage-hud (version unknown)'
       return { text: `${version}, loaded from ${held.source ?? sourceOf($.plugin.root)}: ${$.plugin.root}` }
     }
-    if (arg === 'colors') return { text: colorsText(options.themeColor, colorProblems) }
+    if (arg === 'colors') return { text: colorsText(options.themeColor, colorProblems, asDepth(await read($, depth))) }
     let den = await read($, denominator)
     if (arg !== '') {
       const n = Number(arg)
@@ -801,14 +855,14 @@ export const register: Register = (on, options) => {
     }
     const columns = dockColumns(e.presentation.columns, den)
     askedColumns = columns
-    await $.ui.open({ ...paneArgs(), columns, rows: INLINE_ROWS })
+    await $.ui.open({ ...paneArgs(asDepth(await read($, depth))), columns, rows: INLINE_ROWS })
 
     return { text: `Usage HUD at 1/${den} of the screen (${columns} columns).` }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive, typed, held, pick0, folds, details] =
+    const [snap, log, busy, den, at, maskedCount, mix, used, every, calls, sess, open, alive, typed, held, pick0, folds, details, depth0] =
       await Promise.all([
         read($, snapshot),
         read($, compactions),
@@ -828,7 +882,9 @@ export const register: Register = (on, options) => {
         read($, picked),
         read($, folded),
         read($, opened),
+        read($, depth),
       ])
+    const terminal = asDepth(depth0)
     const viewport = e.viewport
     const isDock = e.props.placement === 'dock' && viewport !== undefined
     const width = Math.max(16, e.props.bodyColumns)
@@ -839,7 +895,7 @@ export const register: Register = (on, options) => {
       const want = dockColumns(viewport.columns, den)
       if (want !== askedColumns) {
         askedColumns = want
-        $.ui.open({ ...paneArgs(), columns: want }).catch(() => undefined)
+        $.ui.open({ ...paneArgs(terminal), columns: want }).catch(() => undefined)
       }
     }
 
@@ -907,7 +963,7 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column">
         {lines.map((runs, i) => {
           const texts = fit(runs, width).map(run => (
-            <Text {...textStyle(run)}>{run.text}</Text>
+            <Text {...textStyle(run, terminal)}>{run.text}</Text>
           ))
           if (texts.length === 0) return <Text> </Text>
           const action = runs.find(run => run.action !== undefined)?.action
@@ -932,6 +988,7 @@ export const register: Register = (on, options) => {
     if (e.props.plugin !== 'usage-hud' || !e.props.id.startsWith(CARD_ROW)) return next(e)
     const card = (await read($, prompts)).find(one => `${CARD_ROW}${one.id}` === e.props.id)
     if (card === undefined) return next(e)
+    const terminal = asDepth(await read($, depth))
     const { Box, Text } = $.ui.resolve(e)
     const width = Math.min(76, Math.max(32, (e.viewport?.columns ?? 80) - 4))
 
@@ -940,7 +997,7 @@ export const register: Register = (on, options) => {
         {cardLines(card, width).map(runs => (
           <Box flexDirection="row">
             {fit(runs, width).map(run => (
-              <Text {...textStyle(run)}>{run.text}</Text>
+              <Text {...textStyle(run, terminal)}>{run.text}</Text>
             ))}
           </Box>
         ))}

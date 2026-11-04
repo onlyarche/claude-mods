@@ -1,6 +1,6 @@
 {
   "name": "usage-hud",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "A small top-right HUD for context fill, auto-compaction, rate limits and cost; shows what each prompt sent along, steers compaction summaries, toasts each turn's cost and masks secrets",
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -38,7 +38,7 @@
     "colorOverrides": {
       "type": "string",
       "title": "Color overrides",
-      "description": "Single colors to set over the theme, as name=#rrggbb separated by commas, e.g. warn=#ff8800, surface=#000000. Names: surface (the HUD's background; surface=terminal keeps the terminal's own), ok, warn, high (gauges), system, mcp, memory, other, messages (context mix), text, muted, label, mark, buffer, track. Empty changes nothing.",
+      "description": "Single colors to set over the theme, as name=#rrggbb separated by commas, e.g. warn=#ff8800, messages=#5f5fd7. surface is the HUD's background: transparent by default (the terminal's own shows through, like the conversation beside it); surface=#1e1e2e paints that color, surface=#1e1e2e+5 or -5 that color 5% lighter or darker, surface=theme the palette's own dark one. Other names: ok, warn, high (gauges), system, mcp, memory, other, messages (context mix), text, muted, label, mark, buffer, track. depth=truecolor|256|16 sets the terminal's color depth where usage-hud reads it otherwise than the engine paints it (to make a terminal show 24-bit color, export COLORTERM=truecolor; in tmux also enable RGB, see /usage-hud colors). Empty changes nothing.",
       "default": ""
     }
   }

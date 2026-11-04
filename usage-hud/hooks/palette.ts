@@ -9,9 +9,10 @@
  * so a series never reads as a status. The inks are the brand hue at low
  * chroma, text ones >= 4.5:1.
  *
- * The HUD paints its own `surface` rather than the terminal's background, so
- * every machine and terminal theme shows the same colors; the palette passes
- * the same checks on it (series 3:1, status ramp, inks >= 6.7:1).
+ * By default the HUD paints no background (transparent): it sits on the
+ * terminal's own, as the conversation beside it does. `surface=theme` paints
+ * the palette's own dark one below instead, on which the palette passes the
+ * same checks (series 3:1, status ramp, inks >= 6.7:1).
  *
  * The person may change it (the options Theme color and Color overrides):
  * another theme color moves every color with it, keeping how each sits
@@ -21,7 +22,7 @@
 
 /** The validated palette, the one every theme is derived from. */
 const VALIDATED = {
-  /** The HUD's own background: the brand hue, nearly black (OKLCH 0.20 0.012 279). */
+  /** The palette's own dark background (`surface=theme`): the brand hue, nearly black (OKLCH 0.20 0.012 279). */
   surface: '#15161c',
   /**
    * Gauges: how worrying a fill is, always beside its % and a ! glyph.
@@ -63,7 +64,7 @@ export const DEFAULT_BASE = VALIDATED.ok
  * undefined leaves the HUD on the terminal's own background.
  */
 export const THEME = {
-  surface: VALIDATED.surface as string | undefined,
+  surface: 'transparent' as string | undefined,
   status: { ok: VALIDATED.ok as string, warn: VALIDATED.warn as string, high: VALIDATED.high as string },
   series: {
     system: VALIDATED.system as string,
@@ -151,6 +152,87 @@ function derive(base: string): Record<ColorName, string> {
   return out
 }
 
+// ---- terminals without 24-bit color --------------------------------------
+
+/**
+ * How many colors the terminal draws: chalk (what the engine paints with)
+ * turns a hex into the nearest of 256 or 16 when it is not `truecolor`.
+ */
+export type ColorDepth = 'truecolor' | '256' | '16'
+
+function toOklab(hex: string): [number, number, number] {
+  const [r, g, b] = [1, 3, 5].map(i => toLinear(parseInt(hex.slice(i, i + 2), 16) / 255)) as [number, number, number]
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+  return [
+    0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  ]
+}
+
+const hexOf = (r: number, g: number, b: number) =>
+  `#${[r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('')}`
+
+/**
+ * The 256 colors a terminal shows, each with the hex that makes chalk pick
+ * exactly it. chalk rounds each channel on its own (r / 255 * 5), so the
+ * cube's own levels (95, 135, ...) would land a step off: the input that
+ * lands on level i is i * 51. An equal r, g and b takes the gray ramp
+ * instead, so the cube's grays are left to the ramp.
+ */
+const CUBE = [0, 95, 135, 175, 215, 255]
+let palette256: { shown: string; input: string; lab: [number, number, number] }[] | undefined
+function colors256() {
+  if (palette256 !== undefined) return palette256
+  const out: { shown: string; input: string; lab: [number, number, number] }[] = []
+  for (let r = 0; r < 6; r++) for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++) {
+    if (r === g && g === b) continue
+    const shown = hexOf(CUBE[r] ?? 0, CUBE[g] ?? 0, CUBE[b] ?? 0)
+    out.push({ shown, input: hexOf(r * 51, g * 51, b * 51), lab: toOklab(shown) })
+  }
+  for (let step = 0; step < 24; step++) {
+    const level = 8 + step * 10
+    const shown = hexOf(level, level, level)
+    const input = Math.round(8 + (step * 247) / 24)
+    out.push({ shown, input: hexOf(input, input, input), lab: toOklab(shown) })
+  }
+  palette256 = out
+  return out
+}
+
+const nearest256 = new Map<string, { shown: string; input: string }>()
+/** The 256-color terminal's nearest color to `hex`, as the eye judges (OKLab). */
+function near256(hex: string): { shown: string; input: string } {
+  const held = nearest256.get(hex)
+  if (held !== undefined) return held
+  const [L, A, B] = toOklab(hex)
+  let best = colors256()[0]!
+  let bestDistance = Infinity
+  for (const one of colors256()) {
+    const distance = (one.lab[0] - L) ** 2 + (one.lab[1] - A) ** 2 + (one.lab[2] - B) ** 2
+    if (distance < bestDistance) {
+      best = one
+      bestDistance = distance
+    }
+  }
+  const found = { shown: best.shown, input: best.input }
+  nearest256.set(hex, found)
+  return found
+}
+
+/** The hex to hand the engine for `hex` on a terminal of this depth. */
+export const forTerminal = (hex: string, depth: ColorDepth): string =>
+  depth === '256' && /^#[0-9a-f]{6}$/i.test(hex) ? near256(hex.toLowerCase()).input : hex
+
+/** What a terminal of this depth shows for `hex`. */
+export const shownOn = (hex: string, depth: ColorDepth): string =>
+  depth === '256' && /^#[0-9a-f]{6}$/i.test(hex) ? near256(hex.toLowerCase()).shown : hex
+
+/** A depth the person set in Color overrides (`depth=256`), over the one read from the terminal. */
+export let depthOverride: ColorDepth | undefined
+
 /** The colors in force, flat, for `/usage-hud colors`. */
 export const currentColors = (): Record<ColorName, string | undefined> => ({
   surface: THEME.surface,
@@ -160,10 +242,31 @@ export const currentColors = (): Record<ColorName, string | undefined> => ({
 })
 
 /**
+ * The HUD's background as an override names it: `transparent` (or
+ * `terminal`) paints nothing, so the terminal's own shows through;
+ * `theme` is the palette's own dark one; `#rrggbb` a color, `#rrggbb+5`
+ * or `-5` that color 5% lighter or darker (OKLCH lightness), to sit just
+ * off the terminal's own. Undefined: not a background it can read.
+ */
+function surfaceOf(value: string, themeSurface: string): string | undefined {
+  const lower = value.toLowerCase()
+  if (lower === 'transparent' || lower === 'terminal') return 'transparent'
+  if (lower === 'theme') return themeSurface
+  const match = /^(#?[0-9a-f]{3}|#?[0-9a-f]{6})(?:([+-])(\d{1,2})%?)?$/i.exec(value)
+  const hex = parseHex(match?.[1])
+  if (match === null || hex === undefined) return undefined
+  if (match[2] === undefined) return hex
+  const [L, C, H] = toOklch(hex)
+  const shift = (match[2] === '-' ? -1 : 1) * Number(match[3]) / 100
+  return fromOklch(Math.min(1, Math.max(0, L + shift)), C, H)
+}
+
+/**
  * Sets the colors from the two options, in place, and says what it could
  * not read. An empty or default theme color keeps the validated palette;
- * overrides are `name=#rrggbb` separated by commas, `surface=terminal`
- * leaving the terminal's own background.
+ * overrides are `name=#rrggbb` separated by commas. The HUD's background is
+ * transparent unless `surface=` says otherwise, so the HUD sits on the
+ * terminal's own background like the conversation beside it.
  */
 export function applyTheme(themeColor: unknown, overrides: unknown): string[] {
   const problems: string[] = []
@@ -173,7 +276,11 @@ export function applyTheme(themeColor: unknown, overrides: unknown): string[] {
   }
   const colors: Record<ColorName, string | undefined> =
     base === undefined || base === DEFAULT_BASE ? { ...VALIDATED } : derive(base)
+  // the palette's own dark background, for `surface=theme`; by default none
+  const themeSurface = colors.surface ?? VALIDATED.surface
+  colors.surface = 'transparent'
 
+  depthOverride = undefined
   const entries = typeof overrides === 'string' ? overrides.split(/[,;\n]/) : []
   for (const entry of entries.map(one => one.trim()).filter(one => one !== '')) {
     const match = /^([A-Za-z]+)\s*[=:]\s*(\S+)$/.exec(entry)
@@ -181,10 +288,17 @@ export function applyTheme(themeColor: unknown, overrides: unknown): string[] {
     const value = match?.[2]
     if (name === undefined || value === undefined) {
       problems.push(`"${entry}" is not name=#rrggbb`)
+    } else if (name === 'depth') {
+      // the terminal's color depth, where reading it from the environment errs
+      const depth = value.toLowerCase()
+      if (depth === 'truecolor' || depth === '256' || depth === '16') depthOverride = depth
+      else problems.push(`depth "${value}" is not truecolor, 256 or 16`)
     } else if (!(COLOR_NAMES as string[]).includes(name)) {
       problems.push(`"${name}" is no color name (${COLOR_NAMES.join(', ')})`)
-    } else if (name === 'surface' && value.toLowerCase() === 'terminal') {
-      colors.surface = undefined
+    } else if (name === 'surface') {
+      const surface = surfaceOf(value, themeSurface)
+      if (surface === undefined) problems.push(`"${value}" for surface is not transparent, theme, #rrggbb or #rrggbb+N`)
+      else colors.surface = surface
     } else {
       const hex = parseHex(value)
       if (hex === undefined) problems.push(`"${value}" for ${name} is not #rrggbb`)

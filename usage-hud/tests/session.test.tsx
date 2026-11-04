@@ -19,10 +19,10 @@ const PANE = {
 } as const
 
 /** Everything a session start asks of the engine, answered from memory. */
-function boot(on: On, seen: { argv?: readonly string[]; opens?: unknown[] } = {}) {
+function boot(on: On, seen: { argv?: readonly string[]; opens?: unknown[] } = {}, env: Record<string, string> = { COLORTERM: 'truecolor' }) {
   mock.clock(on)
   mock.store(on)
-  mock.env(on, { HOME: '/Users/me' })
+  mock.env(on, { HOME: '/Users/me', ...env })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'usage-hud' } }))
   on('ui.open', (_, e) => {
@@ -203,7 +203,7 @@ test('the header shows which build runs, and /usage-hud version says where from'
   expect(String((said as { text?: string }).text)).toMatch(/^usage-hud 9\.9\.9, loaded from local: \/.+usage-hud$/)
 })
 
-test('every open of the HUD paints its own background, so it looks the same everywhere', async ($, on) => {
+test('every open of the HUD sets its background: transparent by default, on the terminal\'s own', async ($, on) => {
   const seen: { opens?: unknown[] } = {}
   boot(on, seen)
   on('command.run', () => ({ text: 'beneath' }))
@@ -220,5 +220,73 @@ test('every open of the HUD paints its own background, so it looks the same ever
 
   const opens = (seen.opens ?? []) as Array<{ backgroundColor?: string }>
   expect(opens.length).toBeGreaterThan(2)
-  for (const open of opens) expect(open.backgroundColor).toBe('#15161c')
+  for (const open of opens) expect(open.backgroundColor).toBe('transparent')
+})
+
+const colorsOf = async ($: { command: { run: (e: never) => Promise<unknown> } }) =>
+  String(((await $.command.run({
+    command: 'usage-hud', args: 'colors', origin: { kind: 'composer' },
+    presentation: { isFullscreen: true, columns: 200 },
+  } as never)) as { text?: string }).text)
+
+test('a 256-color terminal is handed the nearest of its colors, not chalk\'s rounding', { options: { colorOverrides: 'surface=theme' } }, async ($, on) => {
+  const seen: { opens?: unknown[] } = {}
+  boot(on, seen, { TERM_PROGRAM: 'Apple_Terminal', TERM: 'xterm-256color' })
+  on('command.run', () => ({ text: 'beneath' }))
+
+  await $.session.start({ ...START, isInteractive: true })
+
+  // the background: chalk would round #15161c to navy #00005f; the HUD hands
+  // it the input that lands on gray #121212 instead
+  const opens = (seen.opens ?? []) as Array<{ backgroundColor?: string }>
+  expect(opens.at(-1)?.backgroundColor).toBe('#121212')
+  const said = await colorsOf($)
+  expect(said).toContain('terminal: 256 colors (TERM_PROGRAM=Apple_Terminal, TERM=xterm-256color)')
+  expect(said).toContain('surface #15161c→#121212')
+  expect(said).toContain('ok #6266b7→#5f5faf')
+
+  // the drawing's colors too: the label ink #b2b9f1 is shown as #afafff,
+  // which chalk reaches from #9999ff
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const label = await ui.find({ type: 'Text', text: /^ctx $/ })
+  expect(label?.props.color).toBe('#9999ff')
+  await ui.unmount()
+})
+
+test('a 24-bit terminal gets the colors as set', { options: { colorOverrides: 'surface=theme' } }, async ($, on) => {
+  const seen: { opens?: unknown[] } = {}
+  boot(on, seen, { TERM_PROGRAM: 'iTerm.app', TERM: 'xterm-256color' })
+  on('command.run', () => ({ text: 'beneath' }))
+
+  await $.session.start({ ...START, isInteractive: true })
+
+  expect(((seen.opens ?? []) as Array<{ backgroundColor?: string }>).at(-1)?.backgroundColor).toBe('#15161c')
+  expect(await colorsOf($)).toContain('terminal: 24-bit color')
+})
+
+test('depth= in Color overrides corrects a terminal read wrong', { options: { colorOverrides: 'depth=truecolor, surface=theme' } }, async ($, on) => {
+  const seen: { opens?: unknown[] } = {}
+  boot(on, seen, { TERM_PROGRAM: 'Apple_Terminal', TERM: 'xterm-256color' })
+  on('command.run', () => ({ text: 'beneath' }))
+
+  await $.session.start({ ...START, isInteractive: true })
+
+  expect(((seen.opens ?? []) as Array<{ backgroundColor?: string }>).at(-1)?.backgroundColor).toBe('#15161c')
+  expect(await colorsOf($)).toContain('terminal: 24-bit color (set in Color overrides)')
+})
+
+test('inside tmux without 24-bit color, colors says how to let tmux pass it', { options: { colorOverrides: 'surface=theme' } }, async ($, on) => {
+  const seen: { opens?: unknown[] } = {}
+  boot(on, seen, { TMUX: '/tmp/tmux-1000/default,4242,0', TERM: 'tmux-256color' })
+  on('command.run', () => ({ text: 'beneath' }))
+
+  await $.session.start({ ...START, isInteractive: true })
+
+  // tmux-256color with no COLORTERM: the engine paints 256 colors, and the
+  // HUD hands it the nearest of them (the background near-black, not navy)
+  expect(((seen.opens ?? []) as Array<{ backgroundColor?: string }>).at(-1)?.backgroundColor).toBe('#121212')
+  const said = await colorsOf($)
+  expect(said).toContain('terminal: 256 colors (TERM=tmux-256color)')
+  expect(said).toContain('terminal-features ",*:RGB"')
+  expect(said).toContain('export COLORTERM=truecolor')
 })

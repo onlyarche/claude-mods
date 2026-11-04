@@ -157,6 +157,8 @@ declare module 'claude-code' {
       folded: string[]
       /** The context mix or tools row whose details are open (`mix:mcp`), or ''. */
       opened: string
+      /** How many colors the terminal draws: `truecolor`, `256` or `16`. */
+      depth: string
     }
   }
 }

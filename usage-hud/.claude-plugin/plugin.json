@@ -1,6 +1,6 @@
 {
   "name": "usage-hud",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "A small top-right HUD for context fill, auto-compaction, rate limits and cost; shows what each prompt sent along, steers compaction summaries, toasts each turn's cost and masks secrets",
   "license": "MIT",
   "types": "./types/index.d.ts",

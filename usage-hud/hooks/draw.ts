@@ -175,7 +175,7 @@ export const detailNote = (text: string, width: number): Line[] =>
 /** The first `most` of a list as detail lines, then how many more there are. */
 function listed<T>(items: readonly T[], line: (item: T) => Line, width: number, most = 12): Line[] {
   const out = items.slice(0, most).map(line)
-  if (items.length > most) out.push(...detailNote(`+${items.length - most}개 더`, width))
+  if (items.length > most) out.push(...detailNote(`+${items.length - most} more`, width))
   return out
 }
 
@@ -392,32 +392,32 @@ function mixDetail(b: HudBreakdown, key: keyof HudGroups, width: number): Line[]
   const used = (Object.keys(b.groups) as (keyof HudGroups)[])
     .filter(name => name !== 'free' && name !== 'buffer')
     .reduce((sum, name) => sum + b.groups[name], 0)
-  const compactLine = b.compactAt !== undefined ? [detailRow('자동 압축 시점', tokens(b.compactAt), width)] : []
+  const compactLine = b.compactAt !== undefined ? [detailRow('auto-compacts at', tokens(b.compactAt), width)] : []
 
   switch (key) {
     case 'system':
-      return [...detailNote('시스템 프롬프트와 기본 도구 설명. 세션 내내 거의 그대로입니다.', width), ...engineRows('system')]
+      return [...detailNote('The system prompt and built-in tool descriptions. Nearly constant all session.', width), ...engineRows('system')]
     case 'mcp': {
       const servers = b.servers ?? []
       return [
-        ...detailNote(`MCP 서버 ${servers.length}개의 도구 설명 (로드된 도구/전체). 지연 로딩 도구는 쓰기 전까지 세지 않습니다. ⧉ 서버 이름 복사`, width),
+        ...detailNote(`Tool descriptions from ${servers.length} MCP servers (loaded/total). Deferred tools count once used. ⧉ copies the server name`, width),
         ...listed(servers, s => detailRow(`${s.name} ${s.loaded}/${s.tools}`, tokens(s.tokens), width, s.name), width),
       ]
     }
     case 'memory':
       return [
-        ...detailNote('CLAUDE.md 같은 메모리 파일. ⧉ 전체 경로 복사', width),
+        ...detailNote('Memory files such as CLAUDE.md. ⧉ copies the full path', width),
         ...listed(b.memoryFiles ?? [], f => detailRow(shortPath(f.path), tokens(f.tokens), width, f.path), width),
       ]
     case 'other': {
       const named = (s: { name: string; plugin?: string }) => (s.plugin !== undefined ? `${s.plugin}:${s.name}` : s.name)
       return [
-        ...detailNote('서브에이전트 종류, skill, slash command 목록의 설명.', width),
+        ...detailNote('Descriptions in the subagent, skill and slash command lists.', width),
         ...engineRows('other'),
-        ...((b.agentTypes ?? []).length > 0 ? detailNote('agent 종류, 토큰 순 · ⧉ 이름 복사', width) : []),
+        ...((b.agentTypes ?? []).length > 0 ? detailNote('Agent types by tokens · ⧉ copies the name', width) : []),
         ...listed(b.agentTypes ?? [], a => detailRow(a.name, tokens(a.tokens), width, a.name), width, 6),
         ...((b.skillList ?? []).length > 0
-          ? detailNote(`skill ${b.skills}/${b.skillsTotal ?? b.skills}개 나열${b.skillTokens !== undefined ? ` ≈${tokens(b.skillTokens)}` : ''}, 토큰 순 · ⧉ 이름 복사`, width)
+          ? detailNote(`${b.skills}/${b.skillsTotal ?? b.skills} skills listed${b.skillTokens !== undefined ? ` ≈${tokens(b.skillTokens)}` : ''}, by tokens · ⧉ copies the name`, width)
           : []),
         ...listed(b.skillList ?? [], s => detailRow(named(s), tokens(s.tokens), width, named(s)), width, 8),
         ...(b.commands !== undefined
@@ -427,17 +427,17 @@ function mixDetail(b: HudBreakdown, key: keyof HudGroups, width: number): Line[]
     }
     case 'messages':
       return [
-        ...detailNote('대화 내용: 프롬프트, 응답, tool 결과. 대화가 길어질수록 늘고, 압축하면 줄어듭니다.', width),
+        ...detailNote('The conversation: prompts, replies, tool results. Grows as it goes; compaction shrinks it.', width),
         ...engineRows('messages'),
         ...compactLine,
       ]
     case 'buffer':
-      return [...detailNote('자동 압축이 돌 수 있도록 비워 두는 몫. 대화가 이 몫에 닿기 전에 압축이 시작됩니다.', width), ...compactLine]
+      return [...detailNote('Room kept free for auto-compaction, which starts before the conversation reaches it.', width), ...compactLine]
     case 'free':
       return [
-        ...detailNote('아직 비어 있는 공간.', width),
-        ...(b.compactAt !== undefined ? [detailRow('압축까지 남음', tokens(Math.max(0, b.compactAt - used)), width)] : []),
-        ...(b.window !== undefined ? [detailRow('전체 window', tokens(b.window), width)] : []),
+        ...detailNote('Space not used yet.', width),
+        ...(b.compactAt !== undefined ? [detailRow('until compaction', tokens(Math.max(0, b.compactAt - used)), width)] : []),
+        ...(b.window !== undefined ? [detailRow('whole window', tokens(b.window), width)] : []),
       ]
   }
 }
@@ -501,11 +501,11 @@ function copyName(one: HudTally): string {
 function toolDetail(list: HudTally[], kind: HudTally['kind'], width: number, alive: readonly HudAgent[]): Line[] {
   const out: Line[] = []
   if (kind === 'agent' && alive.length > 0) {
-    out.push(...detailNote(`지금 실행 중 ${alive.length}개 · ⧉ agent id 복사`, width))
+    out.push(...detailNote(`${alive.length} running now · ⧉ copies the agent id`, width))
     out.push(...listed(alive, a => detailRow(`${a.type}: ${a.description}`, a.status, width, a.id), width, 5))
   }
   const all = top(list, kind, 500)
-  out.push(...detailNote(`${all.length}개, 많이 쓴 순 · ⧉ 이름 복사`, width))
+  out.push(...detailNote(`${all.length}, most used first · ⧉ copies the name`, width))
   if (kind !== 'plugin') {
     out.push(...listed(all, one => detailRow(one.plugin !== undefined ? `${one.name} · ${one.plugin}` : one.name, String(one.calls), width, copyName(one)), width, 15))
     return out
@@ -516,7 +516,7 @@ function toolDetail(list: HudTally[], kind: HudTally['kind'], width: number, ali
     const parts = list.filter(one => one.kind !== 'plugin' && one.plugin === plugin.name).sort((a, b) => b.calls - a.calls)
     out.push(...listed(parts, one => detailRow(`  ${KIND_LABEL[one.kind]} ${one.name}`, String(one.calls), width), width, 4))
   }
-  if (all.length > 8) out.push(...detailNote(`+${all.length - 8}개 더`, width))
+  if (all.length > 8) out.push(...detailNote(`+${all.length - 8} more`, width))
   return out
 }
 
@@ -524,9 +524,9 @@ function toolDetail(list: HudTally[], kind: HudTally['kind'], width: number, ali
 function loadedDetail(b: HudBreakdown, width: number): Line[] {
   const named = (s: { name: string; plugin?: string }) => (s.plugin !== undefined ? `${s.plugin}:${s.name}` : s.name)
   return [
-    ...detailNote(`MCP 서버 ${b.mcpServers}개 (로드된 도구/전체), 토큰 순 · ⧉ 이름 복사`, width),
+    ...detailNote(`${b.mcpServers} MCP servers (loaded/total), by tokens · ⧉ copies the name`, width),
     ...listed(b.servers ?? [], s => detailRow(`${s.name} ${s.loaded}/${s.tools}`, tokens(s.tokens), width, s.name), width, 10),
-    ...detailNote(`skill ${b.skills}/${b.skillsTotal ?? b.skills}개 나열${b.skillTokens !== undefined ? ` ≈${tokens(b.skillTokens)}` : ''}, 토큰 순`, width),
+    ...detailNote(`${b.skills}/${b.skillsTotal ?? b.skills} skills listed${b.skillTokens !== undefined ? ` ≈${tokens(b.skillTokens)}` : ''}, by tokens`, width),
     ...listed(b.skillList ?? [], s => detailRow(named(s), tokens(s.tokens), width, `/${named(s)}`), width, 8),
     ...(b.commands !== undefined
       ? [detailRow(`slash command ${b.commands.listed}/${b.commands.total}`, tokens(b.commands.tokens), width)]

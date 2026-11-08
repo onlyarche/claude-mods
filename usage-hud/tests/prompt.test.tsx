@@ -91,9 +91,9 @@ test('a typed prompt gets a card of what went with it, under it', async ($, on) 
     const ui = await $.ui.mount({ ...CARD('t1'), surface })
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text.trim())
     // image, CLAUDE.md, date, file, memory, hook, reminder: seven, the late one left out
-    expect(texts.find(t => t.startsWith('입력'))).toMatch(/^입력 ≈\d+ tok · context 7개 ≈/)
-    for (const want of ['첨부', 'shot.png', '기본', 'CLAUDE.md · repo/CLAUDE.md', 'date',
-      '@파일', 'src/api.ts', 'memory', 'api/CLAUDE.md', 'hook', 'UserPromptSubmit', '알림', 'todo reminder']) {
+    expect(texts.find(t => t.startsWith('typed'))).toMatch(/^typed ≈\d+ tok · context 7 ≈/)
+    for (const want of ['attach', 'shot.png', 'base', 'CLAUDE.md · repo/CLAUDE.md', 'date',
+      '@file', 'src/api.ts', 'memory', 'api/CLAUDE.md', 'hook', 'UserPromptSubmit', 'notice', 'todo reminder']) {
       expect(texts).toContain(want)
     }
     await ui.unmount()
@@ -102,7 +102,7 @@ test('a typed prompt gets a card of what went with it, under it', async ($, on) 
   // the HUD's prompt section: its title docked and inline alike
   for (const placement of ['dock', 'inline'] as const) {
     const pane = await $.ui.mount({ ...PANE, props: { ...PANE.props, placement }, surface: 'terminal' })
-    expect(await pane.find({ type: 'Text', text: /^prompt · 입력 ≈\d+ · ctx 7 ≈/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /^prompt · text ≈\d+ · ctx 7 ≈/ })).toBeDefined()
     await pane.unmount()
   }
 
@@ -129,7 +129,7 @@ test('a typed prompt gets a card of what went with it, under it', async ($, on) 
   // a click on the title folds the section, a second unfolds it
   await pane.press({ key: 'toggle-prompt' })
   expect(await rows()).not.toContain('shot.png')
-  expect(await pane.find({ type: 'Text', text: /^prompt · 입력/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /^prompt · text/ })).toBeDefined()
   await pane.press({ key: 'toggle-prompt' })
   expect(await rows()).toContain('shot.png')
   await pane.unmount()
@@ -146,7 +146,7 @@ test('a reminder injected mid-turn stays off the next prompt', async ($, on) => 
   await $.turn.complete(done('t2'))
 
   const ui = await $.ui.mount({ ...CARD('t2'), surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /추가 context 없음/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /no extra context/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -178,6 +178,6 @@ test('the card is off when the option is', { options: { promptContext: false } }
   expect(placed).toEqual([])
   // the HUD's section still sums it up
   const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await pane.find({ type: 'Text', text: /^prompt · 입력 ≈\d+ · no ctx/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /^prompt · text ≈\d+ · no ctx/ })).toBeDefined()
   await pane.unmount()
 })

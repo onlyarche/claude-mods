@@ -101,12 +101,12 @@ test('a context mix row opens what is behind it, one at a time', async ($, on) =
   // free: what is left before compaction: 160k less 125.5k in use
   // (system 17k, MCP 10k, memory 3k, agents·skills 3.5k, messages 92k)
   await ui.press({ key: 'open-mix:free' })
-  expect(await texts()).toContain('압축까지 남음')
+  expect(await texts()).toContain('until compaction')
   expect(await texts()).toContain('35k')
 
   // a second click closes it
   await ui.press({ key: 'open-mix:free' })
-  expect(await texts()).not.toContain('압축까지 남음')
+  expect(await texts()).not.toContain('until compaction')
   await ui.unmount()
 })
 

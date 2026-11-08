@@ -115,23 +115,23 @@ export const mediaItem = (m: { type: string; filename?: string; mediaType?: stri
 })
 
 const KIND: Record<HudCtxItem['kind'], string> = {
-  file: '@파일',
+  file: '@file',
   memory: 'memory',
   hook: 'hook',
   plugin: 'plugin',
-  notice: '알림',
-  media: '첨부',
-  base: '기본',
+  notice: 'notice',
+  media: 'attach',
+  base: 'base',
 }
 
 const sum = (items: readonly HudCtxItem[]) => items.reduce((n, item) => n + (item.tokens ?? 0), 0)
 
-/** `입력 ≈40 tok · context 5개 ≈3.4k`: the card's headline figures. */
+/** `typed ≈40 tok · context 5 ≈3.4k`: the card's headline figures. */
 function figures(card: HudPromptCard): string {
   const ctx = card.items.length === 0
-    ? card.isOpen ? 'context 수집 중…' : '추가 context 없음'
-    : `context ${card.items.length}개 ≈${tokens(sum(card.items))}`
-  return `입력 ≈${tokens(card.typedTokens)} tok · ${ctx}`
+    ? card.isOpen ? 'collecting context…' : 'no extra context'
+    : `context ${card.items.length} ≈${tokens(sum(card.items))}`
+  return `typed ≈${tokens(card.typedTokens)} tok · ${ctx}`
 }
 
 /** The card drawn under a prompt in the transcript. */
@@ -139,7 +139,7 @@ export function cardLines(card: HudPromptCard, width: number, most = 8): Line[] 
   const out: Line[] = [
     fit([
       { text: '  ↳ ', color: THEME.status.ok, bold: true },
-      { text: '함께 보냄 · ', color: ink.label },
+      { text: 'sent along · ', color: ink.label },
       { text: figures(card), color: ink.muted },
     ], width),
   ]
@@ -155,7 +155,7 @@ export function cardLines(card: HudPromptCard, width: number, most = 8): Line[] 
     ])
   }
   if (card.items.length > shown.length) {
-    out.push([{ text: `    +${card.items.length - shown.length}개 더 · 전체와 세부 내용은 오른쪽 HUD의 prompt 구역에서`, color: ink.muted }])
+    out.push([{ text: `    +${card.items.length - shown.length} more · details in the HUD's prompt section`, color: ink.muted }])
   }
   return out
 }
@@ -174,7 +174,7 @@ function detailLines(item: HudCtxItem, width: number): Line[] {
   if (item.type !== undefined) out.push(...field('type', item.type))
   if (item.from !== undefined) out.push(...field('from', item.from))
   if (item.chars !== undefined) {
-    const size = `${grouped(item.chars)}자${item.tokens !== undefined ? ` ≈${tokens(item.tokens)} tok` : ''}`
+    const size = `${grouped(item.chars)} chars${item.tokens !== undefined ? ` ≈${tokens(item.tokens)} tok` : ''}`
     out.push(...field('size', size))
   }
   if (item.preview !== undefined && item.preview !== '') {
@@ -184,10 +184,10 @@ function detailLines(item: HudCtxItem, width: number): Line[] {
     }
     const shownChars = lines.slice(0, PREVIEW_LINES).join('').length
     const rest = (item.chars ?? item.preview.length) - shownChars
-    if (rest > 0) out.push(fit([bar, { text: `… ${grouped(rest)}자 더`, color: ink.muted }], width))
+    if (rest > 0) out.push(fit([bar, { text: `… ${grouped(rest)} more chars`, color: ink.muted }], width))
     // what was kept of it, whole: the preview's head, at most PREVIEW_CHARS
     const isWhole = (item.chars ?? 0) <= item.preview.length
-    out.push(detailRow(isWhole ? '내용 복사' : `내용 복사 (앞 ${grouped(item.preview.length)}자)`, '', width, item.preview))
+    out.push(detailRow(isWhole ? 'copy text' : `copy text (first ${grouped(item.preview.length)} chars)`, '', width, item.preview))
   }
   return out
 }
@@ -204,9 +204,9 @@ export function promptSection(
 ): Line[] {
   if (card === undefined) return []
   const ctx = card.items.length === 0
-    ? card.isOpen ? '수집 중' : 'no ctx'
+    ? card.isOpen ? 'collecting' : 'no ctx'
     : `ctx ${card.items.length} ≈${tokens(sum(card.items))}`
-  const out: Line[] = [sectionRule('prompt', `prompt · 입력 ≈${tokens(card.typedTokens)} · ${ctx}`, isFolded, width)]
+  const out: Line[] = [sectionRule('prompt', `prompt · text ≈${tokens(card.typedTokens)} · ${ctx}`, isFolded, width)]
   if (isFolded) return out
 
   const labelRoom = Math.max(6, width - 2 - 7 - 6)
